@@ -9,7 +9,7 @@ https://arxiv.org/abs/2310.18547
 import torch
 
 from vllm import envs
-from vllm.lora.ops.triton_ops.kernel_utils import do_shrink_kernel
+from vllm.lora.ops.triton_ops.kernel_utils import do_shrink_kernel, mm_k
 from vllm.lora.ops.triton_ops.utils import (
     _get_lora_a_ptr,
     get_lora_op_configs,
@@ -17,6 +17,227 @@ from vllm.lora.ops.triton_ops.utils import (
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.worker.workspace import current_workspace_manager
+
+# Deterministic split-K for the batch-invariant shrink path. 0 keeps the
+# existing single-pass (S1) kernel; 8 enables the fixed two-pass kernel
+# below. envs.py rejects any other value, so this is read once at import
+# time and does not vary per call.
+_TWO_PASS_SPLIT_K = envs.VLLM_LORA_DETERMINISTIC_SPLIT_K
+if _TWO_PASS_SPLIT_K:
+    if not envs.VLLM_BATCH_INVARIANT:
+        raise RuntimeError(
+            "VLLM_LORA_DETERMINISTIC_SPLIT_K=8 requires VLLM_BATCH_INVARIANT=1; "
+            "the deterministic two-pass reduction is only meaningful under "
+            "batch-invariant execution."
+        )
+    if envs.VLLM_LORA_ENABLE_DUAL_STREAM:
+        raise RuntimeError(
+            "VLLM_LORA_DETERMINISTIC_SPLIT_K=8 cannot be combined with "
+            "VLLM_LORA_ENABLE_DUAL_STREAM=1 in this release; disable one of "
+            "the two before starting the process."
+        )
+
+
+def _get_two_pass_partials(
+    output: torch.Tensor, num_slices: int, split_k: int, m: int, n: int
+) -> torch.Tensor:
+    # The runner-owned workspace supplies lifecycle, ubatch isolation, growth
+    # locking, and shutdown cleanup. The execution stream remains part of the
+    # owner key because partial and reduction kernels may overlap across
+    # streams.
+    stream_id = torch.cuda.current_stream(output.device).cuda_stream
+    (partials,) = current_workspace_manager().get_simultaneous_named(
+        ("lora_shrink_two_pass", stream_id),
+        ((num_slices, split_k, m, n), torch.float32),
+    )
+    return partials
+
+
+@triton.jit
+def _lora_shrink_partial_kernel(
+    input_ptr,
+    lora_ptr,
+    partial_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    token_indices_sorted_by_lora_ids,
+    num_tokens_per_lora,
+    lora_token_start_loc,
+    lora_ids,
+    input_d0_stride,
+    input_d1_stride,
+    lora_d0_stride,
+    lora_d1_stride,
+    lora_d2_stride,
+    partial_d0_stride,
+    partial_d1_stride,
+    partial_d2_stride,
+    partial_d3_stride,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SLICE_NUM: tl.constexpr,
+):
+    cta_n_num = tl.cdiv(N, BLOCK_N)
+    cta_m_num = tl.cdiv(M, BLOCK_M)
+    pid_sk_m_n = tl.program_id(axis=0)
+    pid_sk = pid_sk_m_n % SPLIT_K
+    pid_m_n = pid_sk_m_n // SPLIT_K
+    num_pid_in_group = GROUP_SIZE_M * cta_n_num
+    group_id = pid_m_n // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(cta_m_num - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid_m_n % num_pid_in_group) % group_size_m)
+    pid_n = (pid_m_n % num_pid_in_group) // group_size_m
+
+    slice_id = tl.program_id(axis=1)
+    lora_idx = tl.program_id(axis=2)
+    lora_id = tl.load(lora_ids + lora_idx)
+    if lora_id == -1:
+        return
+
+    lora_m_size = tl.load(num_tokens_per_lora + lora_idx)
+    cta_m_offset = pid_m * BLOCK_M
+    if cta_m_offset >= lora_m_size:
+        return
+
+    cta_m_len = min(BLOCK_M, lora_m_size - cta_m_offset)
+    lora_m_indices_start = tl.load(lora_token_start_loc + lora_idx)
+    cta_lora_seq_indices = (
+        token_indices_sorted_by_lora_ids + lora_m_indices_start + cta_m_offset
+    )
+    offset_m = tl.arange(0, BLOCK_M) % cta_m_len
+    ram = tl.load(cta_lora_seq_indices + offset_m)
+
+    if SLICE_NUM == 1:
+        cur_lora_ptr = lora_ptr
+    else:
+        cur_lora_ptr = tl.load(lora_ptr + slice_id).to(
+            tl.pointer_type(input_ptr.dtype.element_ty)
+        )
+
+    offset_n = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
+    rbn = tl.max_contiguous(tl.multiple_of(offset_n % N, BLOCK_N), BLOCK_N)
+    offset_k = pid_sk * BLOCK_K + tl.arange(0, BLOCK_K)
+    a_ptr = (
+        input_ptr
+        + ram[:, None].to(tl.int64) * input_d0_stride
+        + offset_k[None, :] * input_d1_stride
+    )
+    b_ptr = (
+        cur_lora_ptr
+        + lora_d0_stride * lora_id
+        + rbn[None, :] * lora_d1_stride
+        + offset_k[:, None] * lora_d2_stride
+    )
+    accumulator = mm_k(
+        a_ptr,
+        b_ptr,
+        input_d1_stride,
+        lora_d2_stride,
+        offset_k,
+        K,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        EVEN_K,
+        SPLIT_K,
+        False,
+        cur_lora_ptr.dtype.element_ty,
+        False,
+        base_k=pid_sk * BLOCK_K,
+    )
+
+    offset_cm = tl.arange(0, BLOCK_M)
+    partial_out = (
+        partial_ptr
+        + slice_id * partial_d0_stride
+        + pid_sk * partial_d1_stride
+        + ram[:, None] * partial_d2_stride
+        + offset_n[None, :] * partial_d3_stride
+    )
+    mask = (offset_cm[:, None] < cta_m_len) & (offset_n[None, :] < N)
+    tl.store(partial_out, accumulator, mask=mask)
+
+
+@triton.jit
+def _lora_shrink_reduce_kernel(
+    partial_ptr,
+    out_ptr,
+    M,
+    N: tl.constexpr,
+    token_indices_sorted_by_lora_ids,
+    num_tokens_per_lora,
+    lora_token_start_loc,
+    lora_ids,
+    scaling,
+    partial_d0_stride,
+    partial_d1_stride,
+    partial_d2_stride,
+    partial_d3_stride,
+    output_d0_stride,
+    output_d1_stride,
+    output_d2_stride,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    cta_n_num = tl.cdiv(N, BLOCK_N)
+    cta_m_num = tl.cdiv(M, BLOCK_M)
+    pid_m_n = tl.program_id(axis=0)
+    num_pid_in_group = GROUP_SIZE_M * cta_n_num
+    group_id = pid_m_n // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(cta_m_num - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid_m_n % num_pid_in_group) % group_size_m)
+    pid_n = (pid_m_n % num_pid_in_group) // group_size_m
+
+    slice_id = tl.program_id(axis=1)
+    lora_idx = tl.program_id(axis=2)
+    lora_id = tl.load(lora_ids + lora_idx)
+    if lora_id == -1:
+        return
+
+    lora_m_size = tl.load(num_tokens_per_lora + lora_idx)
+    cta_m_offset = pid_m * BLOCK_M
+    if cta_m_offset >= lora_m_size:
+        return
+
+    cta_m_len = min(BLOCK_M, lora_m_size - cta_m_offset)
+    lora_m_indices_start = tl.load(lora_token_start_loc + lora_idx)
+    cta_lora_seq_indices = (
+        token_indices_sorted_by_lora_ids + lora_m_indices_start + cta_m_offset
+    )
+    offset_m = tl.arange(0, BLOCK_M) % cta_m_len
+    ram = tl.load(cta_lora_seq_indices + offset_m)
+    offset_n = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
+    offset_cm = tl.arange(0, BLOCK_M)
+    mask = (offset_cm[:, None] < cta_m_len) & (offset_n[None, :] < N)
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for split_id in range(SPLIT_K):
+        partial_in = (
+            partial_ptr
+            + slice_id * partial_d0_stride
+            + split_id * partial_d1_stride
+            + ram[:, None] * partial_d2_stride
+            + offset_n[None, :] * partial_d3_stride
+        )
+        accumulator += tl.load(partial_in, mask=mask, other=0.0)
+
+    output = (
+        out_ptr
+        + slice_id * output_d0_stride
+        + ram[:, None] * output_d1_stride
+        + offset_n[None, :] * output_d2_stride
+    )
+    tl.store(output, accumulator * scaling, mask=mask)
 
 
 @triton.jit
@@ -167,6 +388,23 @@ def _lora_shrink(
 
     """
     assert no_lora_flag_cpu.numel() == 1
+    if inputs.size(0) == 0:
+        # An empty first call has no work and must not create a zero-byte
+        # named workspace. The manager represents an unallocated slot as
+        # None, which cannot be sliced into a tensor view.
+        return
+    partials: torch.Tensor | None = None
+    if _TWO_PASS_SPLIT_K:
+        # Reserve even for the no-LoRA warmup/profile path. This guarantees
+        # that the runner sees the maximum shape before locking its workspace
+        # for steady-state execution and CUDA Graph replay.
+        partials = _get_two_pass_partials(
+            output_tensor,
+            output_tensor.size(0),
+            _TWO_PASS_SPLIT_K,
+            inputs.size(0),
+            output_tensor.size(-1),
+        )
     if no_lora_flag_cpu.item():
         # None of the inputs require LoRA.
         return
@@ -213,6 +451,16 @@ def _lora_shrink(
     NUM_STAGES = kernel_config["num_stages"]
     NUM_CTAS = kernel_config["num_ctas"]
     GROUP_SIZE_M = kernel_config.get("group_size_m", 8)
+
+    # Deterministic split-K path (Section 2 of the LoRA split-K plan). Each
+    # split writes to a unique FP32 scratch tile, then a second kernel
+    # reduces splits in a fixed order. Batch invariance requires every M to
+    # preserve the same logical K partition and fixed reduction order; do
+    # not dispatch to S1 based on M, and do not restore the old M<=128
+    # S8/S1 gate.
+    if _TWO_PASS_SPLIT_K:
+        BLOCK_K = 256
+        SPLIT_K = _TWO_PASS_SPLIT_K
     EVEN_K = K % (BLOCK_K * SPLIT_K) == 0  # type: ignore
 
     # TODO (varun): This grid formulation maximizes parallelization at the
@@ -223,6 +471,70 @@ def _lora_shrink(
         NUM_SLICES,
         num_active_loras.item(),
     )
+
+    if _TWO_PASS_SPLIT_K:
+        assert partials is not None
+        _lora_shrink_partial_kernel[grid](
+            inputs,
+            lora_ptr_tensor,
+            partials,
+            M,
+            N,
+            K,
+            token_indices_sorted_by_lora_ids,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            lora_ids,
+            inputs.stride(0),
+            inputs.stride(1),
+            lora_strides_d0,
+            lora_strides_d1,
+            lora_strides_d2,
+            partials.stride(0),
+            partials.stride(1),
+            partials.stride(2),
+            partials.stride(3),
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            EVEN_K,
+            SPLIT_K,
+            GROUP_SIZE_M,
+            NUM_SLICES,
+            num_warps=NUM_WARPS,
+            num_ctas=NUM_CTAS,
+            num_stages=NUM_STAGES,
+        )
+        reduce_grid = (
+            triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
+            NUM_SLICES,
+            num_active_loras.item(),
+        )
+        _lora_shrink_reduce_kernel[reduce_grid](
+            partials,
+            output_tensor,
+            M,
+            N,
+            token_indices_sorted_by_lora_ids,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            lora_ids,
+            scaling,
+            partials.stride(0),
+            partials.stride(1),
+            partials.stride(2),
+            partials.stride(3),
+            output_tensor.stride(0),
+            output_tensor.stride(1),
+            output_tensor.stride(2),
+            BLOCK_M,
+            BLOCK_N,
+            SPLIT_K,
+            GROUP_SIZE_M,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
+        )
+        return
 
     # PDL only works when dual-stream is being used.
     use_gdc = supports_pdl(inputs.device) and envs.VLLM_LORA_ENABLE_DUAL_STREAM

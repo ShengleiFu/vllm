@@ -138,6 +138,35 @@ Batch invariance has been tested and verified on the following models:
 
 Other models may also work, but these have been explicitly validated. If you encounter issues with a specific model, please report them on the [GitHub issue tracker](https://github.com/vllm-project/vllm/issues/new/choose).
 
+## LoRA Deterministic Split-K (SM89, Experimental)
+
+The batch-invariant LoRA shrink kernel normally runs with split-K disabled
+(`S1`), which serializes the K-dimension reduction to avoid non-deterministic
+floating-point atomics. `VLLM_LORA_DETERMINISTIC_SPLIT_K=8` restores
+K-dimension parallelism instead: it splits the reduction into 8 fixed FP32
+partial-sum tiles and reduces them in a fixed order, without atomics.
+
+```bash
+VLLM_BATCH_INVARIANT=1 VLLM_LORA_DETERMINISTIC_SPLIT_K=8 vllm serve <model> \
+    --enable-lora --lora-modules ...
+```
+
+Requirements and current limitations:
+
+- Requires `VLLM_BATCH_INVARIANT=1`; the process raises at startup otherwise.
+- Only `0` (disabled) and `8` are accepted values.
+- Cannot be combined with `VLLM_LORA_ENABLE_DUAL_STREAM=1` in this release;
+  the process raises at startup if both are set.
+- Validated on CUDA dense LoRA shrink with BF16/FP16 inputs and an FP32
+  accumulation buffer on SM89 (Ada Lovelace).
+
+!!! warning
+    The split-K=8 path is **not** guaranteed to be numerically identical to
+    the existing S1 path. Both are batch-invariant on their own, but they use
+    different reduction orders, so selected-token and selected-logprob
+    differences between S1 and S8 have been observed. Do not treat S8 as a
+    drop-in bitwise replacement for S1.
+
 ## Implementation Details
 
 When batch invariance is enabled, vLLM:

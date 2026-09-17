@@ -3,7 +3,7 @@
 
 import inspect
 import os
-from collections.abc import Iterator
+from collections.abc import Hashable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from itertools import accumulate
@@ -66,6 +66,10 @@ class WorkspaceManager:
         self._current_workspaces: list[torch.Tensor | None] = [None] * (
             self._num_ubatches * self._num_lanes
         )
+        # Dedicated owner pools are used by operations whose scratch can
+        # overlap the anonymous workspace or another execution stream. They
+        # retain the same ubatch/lane isolation and lifecycle as the manager.
+        self._named_workspaces: dict[Hashable, list[torch.Tensor | None]] = {}
         self._locked: bool = False
 
     @staticmethod
@@ -140,6 +144,73 @@ class WorkspaceManager:
             .reshape(shapes_and_dtypes[i][0])
             for i in range(len(shapes_and_dtypes))
         ]
+
+    def get_simultaneous_named(
+        self,
+        owner: Hashable,
+        *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype],
+    ) -> list[torch.Tensor]:
+        """Get scratch from a manager-owned pool dedicated to ``owner``.
+
+        Named pools are for operations that may overlap the anonymous
+        workspace or another execution stream. They are bounded by this
+        manager's lifetime, use the current ubatch/lane slot, and obey the
+        same growth lock as the anonymous pool.
+        """
+        actual_bytes = [_compute_bytes(s, d) for s, d in shapes_and_dtypes]
+        aligned_bytes = [round_up(actual, 256) for actual in actual_bytes]
+        total_bytes = sum(aligned_bytes)
+        offsets = list(accumulate([0] + aligned_bytes[:-1]))
+        current_workspace = self._ensure_named_workspace_size(owner, total_bytes)
+        return [
+            current_workspace[offsets[i] : offsets[i] + actual_bytes[i]]
+            .view(shapes_and_dtypes[i][1])
+            .reshape(shapes_and_dtypes[i][0])
+            for i in range(len(shapes_and_dtypes))
+        ]
+
+    def _ensure_named_workspace_size(
+        self, owner: Hashable, required_bytes: int
+    ) -> torch.Tensor:
+        ubatch_id = dbo_current_ubatch_id()
+        lane = _workspace_lane.get()
+        if lane >= self._num_lanes:
+            raise RuntimeError(
+                f"Workspace lane {lane} is not configured; manager has "
+                f"{self._num_lanes} lane(s)."
+            )
+        workspace_id = ubatch_id * self._num_lanes + lane
+        slots = self._named_workspaces.setdefault(
+            owner,
+            [None] * (self._num_ubatches * self._num_lanes),
+        )
+        current_workspace = slots[workspace_id]
+        current_size = self._workspace_size_bytes(current_workspace)
+        if current_size < required_bytes:
+            if self._locked:
+                raise AssertionError(
+                    f"Named workspace {owner!r} is locked but requires "
+                    f"{required_bytes / _MB:.2f} MB; current size is "
+                    f"{current_size / _MB:.2f} MB."
+                )
+            slots[workspace_id] = None
+            del current_workspace
+            torch.accelerator.empty_cache()
+            slots[workspace_id] = torch.empty(
+                (required_bytes,), dtype=torch.uint8, device=self._device
+            )
+            current_workspace = slots[workspace_id]
+            if envs.VLLM_DEBUG_WORKSPACE:
+                logger.info(
+                    "[WORKSPACE DEBUG] Resized named workspace %r: "
+                    "%.2f MB -> %.2f MB (ubatch %d, lane %d)",
+                    owner,
+                    current_size / _MB,
+                    required_bytes / _MB,
+                    ubatch_id,
+                    lane,
+                )
+        return current_workspace
 
     def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.

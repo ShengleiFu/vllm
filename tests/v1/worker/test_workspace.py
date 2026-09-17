@@ -125,3 +125,85 @@ def test_workspace_lane_validation(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="at least one"):
         workspace.WorkspaceManager(torch.device("cpu"), num_lanes=0)
+
+
+def test_named_workspace_reuses_within_capacity_and_isolates_owners(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=1, num_lanes=1
+    )
+
+    (buf_a1,) = manager.get_simultaneous_named("owner_a", ((256,), torch.uint8))
+    (buf_a2,) = manager.get_simultaneous_named("owner_a", ((8,), torch.uint8))
+    assert buf_a1.data_ptr() == buf_a2.data_ptr()
+
+    (buf_b,) = manager.get_simultaneous_named("owner_b", ((256,), torch.uint8))
+    assert buf_b.data_ptr() != buf_a1.data_ptr()
+
+    # A named pool does not alias the anonymous pool either.
+    (anon,) = manager.get_simultaneous(((256,), torch.uint8))
+    assert anon.data_ptr() != buf_a1.data_ptr()
+    assert anon.data_ptr() != buf_b.data_ptr()
+
+
+def test_named_workspace_isolates_by_ubatch_and_lane(monkeypatch) -> None:
+    active_ubatch = [0]
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: active_ubatch[0])
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=2, num_lanes=2
+    )
+
+    pointers = set()
+    for ubatch_id in range(2):
+        active_ubatch[0] = ubatch_id
+        for lane in range(2):
+            with workspace.use_workspace_lane(lane):
+                (buf,) = manager.get_simultaneous_named(
+                    "shared_owner", ((16,), torch.uint8)
+                )
+                pointers.add(buf.data_ptr())
+
+    assert len(pointers) == 4
+
+
+def test_named_workspace_lock_blocks_growth_and_allows_reuse(monkeypatch) -> None:
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=1)
+
+    (buf,) = manager.get_simultaneous_named("owner", ((256,), torch.uint8))
+    manager.lock()
+    assert manager.is_locked()
+
+    (same,) = manager.get_simultaneous_named("owner", ((256,), torch.uint8))
+    (smaller,) = manager.get_simultaneous_named("owner", ((8,), torch.uint8))
+    assert same.data_ptr() == buf.data_ptr()
+    assert smaller.data_ptr() == buf.data_ptr()
+
+    with pytest.raises(AssertionError, match="is locked"):
+        manager.get_simultaneous_named("owner", ((512,), torch.uint8))
+
+    # A different owner requested for the first time while locked must also
+    # fail loudly instead of silently allocating.
+    with pytest.raises(AssertionError, match="is locked"):
+        manager.get_simultaneous_named("brand_new_owner", ((8,), torch.uint8))
+
+    manager.unlock()
+    (grown,) = manager.get_simultaneous_named("owner", ((512,), torch.uint8))
+    assert grown.numel() == 512
+
+
+def test_named_workspace_reset_reinitializes(monkeypatch) -> None:
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=1)
+
+    (buf,) = manager.get_simultaneous_named("owner", ((256,), torch.uint8))
+    assert manager._named_workspaces["owner"][0] is not None
+
+    # A fresh manager (as created on reset_workspace_manager()) starts with
+    # no named pools at all.
+    manager2 = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=1)
+    assert manager2._named_workspaces == {}
+    (buf2,) = manager2.get_simultaneous_named("owner", ((256,), torch.uint8))
+    assert buf2.data_ptr() != buf.data_ptr()
