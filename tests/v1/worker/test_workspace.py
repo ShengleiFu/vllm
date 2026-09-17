@@ -196,14 +196,25 @@ def test_named_workspace_lock_blocks_growth_and_allows_reuse(monkeypatch) -> Non
 
 def test_named_workspace_reset_reinitializes(monkeypatch) -> None:
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
-    manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=1)
+    try:
+        workspace.init_workspace_manager(torch.device("cpu"), num_lanes=1)
+        manager = workspace.current_workspace_manager()
 
-    (buf,) = manager.get_simultaneous_named("owner", ((256,), torch.uint8))
-    assert manager._named_workspaces["owner"][0] is not None
+        (buf,) = manager.get_simultaneous_named("owner", ((256,), torch.uint8))
+        assert manager._named_workspaces["owner"][0] is not None
 
-    # A fresh manager (as created on reset_workspace_manager()) starts with
-    # no named pools at all.
-    manager2 = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=1)
-    assert manager2._named_workspaces == {}
-    (buf2,) = manager2.get_simultaneous_named("owner", ((256,), torch.uint8))
-    assert buf2.data_ptr() != buf.data_ptr()
+        # Exercise the actual public reset/init lifecycle (as used by tests
+        # and elastic-EP scaling), not just a second manager instance
+        # constructed and inspected in isolation.
+        workspace.reset_workspace_manager()
+        assert not workspace.is_workspace_manager_initialized()
+
+        workspace.init_workspace_manager(torch.device("cpu"), num_lanes=1)
+        manager2 = workspace.current_workspace_manager()
+
+        assert manager2 is not manager
+        assert manager2._named_workspaces == {}
+        (buf2,) = manager2.get_simultaneous_named("owner", ((256,), torch.uint8))
+        assert buf2.data_ptr() != buf.data_ptr()
+    finally:
+        workspace.reset_workspace_manager()

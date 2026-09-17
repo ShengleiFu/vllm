@@ -43,12 +43,15 @@ def _get_two_pass_partials(
     output: torch.Tensor, num_slices: int, split_k: int, m: int, n: int
 ) -> torch.Tensor:
     # The runner-owned workspace supplies lifecycle, ubatch isolation, growth
-    # locking, and shutdown cleanup. The execution stream remains part of the
-    # owner key because partial and reduction kernels may overlap across
-    # streams.
-    stream_id = torch.cuda.current_stream(output.device).cuda_stream
+    # locking, and shutdown cleanup. The owner key intentionally excludes the
+    # current CUDA stream: split-K=8 is rejected at import time whenever LoRA
+    # dual-stream is enabled (see the guard above), so this path never has
+    # two streams needing live scratch concurrently. A single stable owner
+    # also means transient streams used during memory/graph-memory profiling
+    # and the real capture stream reuse the same slot instead of each
+    # permanently retaining their own allocation.
     (partials,) = current_workspace_manager().get_simultaneous_named(
-        ("lora_shrink_two_pass", stream_id),
+        "lora_shrink_two_pass",
         ((num_slices, split_k, m, n), torch.float32),
     )
     return partials
