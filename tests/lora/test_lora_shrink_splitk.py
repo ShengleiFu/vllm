@@ -651,8 +651,13 @@ _STREAM_ISOLATION_SCRIPT = textwrap.dedent(
         )
         lora_meta.prepare_tensors(mapping)
         out = torch.zeros((NSLICES, M, RANK), dtype=torch.float32, device=device)
+        # Capture the producer stream *before* switching onto `stream` --
+        # torch.cuda.current_stream() called inside the `with` block below
+        # would return `stream` itself, making wait_stream() a no-op
+        # self-wait instead of waiting for inputs/mapping/lora_meta above.
+        producer_stream = torch.cuda.current_stream()
         with torch.cuda.stream(stream):
-            stream.wait_stream(torch.cuda.current_stream())
+            stream.wait_stream(producer_stream)
             _LORA_A_PTR_DICT.clear()
             lora_shrink(
                 inputs, lora_a, out,
@@ -834,6 +839,214 @@ def test_lora_shrink_splitk_shared_experts_stream_isolation():
     result = _run(_SHARED_EXPERTS_STREAM_SCRIPT, _S8_ENV, timeout=300)
     print(json.dumps({k: v for k, v in result.items() if k != "mismatches"}, indent=2))
     assert result["all_matched"], result
+
+
+# ---------------------------------------------------------------------------
+# Workspace-lock lifecycle regressions (second review round): a stream that
+# only appears for batch sizes small enough to trigger the MoE
+# shared-experts overlap path may never be warmed up before the workspace
+# locks, and a throwaway profiling stream's scratch must actually be
+# released, not merely retained-and-documented.
+# ---------------------------------------------------------------------------
+
+_NEW_STREAM_AFTER_LOCK_SCRIPT = textwrap.dedent(
+    """
+    import json
+    import torch
+    from vllm.lora.ops.triton_ops import lora_shrink
+    from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
+    from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
+    from vllm.v1.worker.workspace import init_workspace_manager, lock_workspace
+
+    device = "cuda:0"
+    init_workspace_manager(torch.device(device))
+
+    HIDDEN = 2560
+    RANK = 16
+    NUM_ADAPTERS = 2
+    NSLICES = 1
+    SCALING = 0.9
+    DTYPE = torch.bfloat16
+    M = 32
+
+    lora_a = [torch.randn((NUM_ADAPTERS, RANK, HIDDEN), dtype=DTYPE, device=device)]
+
+    def run(stream, seed):
+        g = torch.Generator(device=device).manual_seed(seed)
+        inputs = torch.randn((M, HIDDEN), dtype=DTYPE, device=device, generator=g)
+        mapping = torch.randint(
+            0, NUM_ADAPTERS, (M,), dtype=torch.int32, device=device, generator=g
+        )
+        meta = LoRAKernelMeta.make(
+            max_loras=NUM_ADAPTERS, max_num_tokens=M, device=device
+        )
+        meta.prepare_tensors(mapping)
+        out = torch.zeros((NSLICES, M, RANK), dtype=torch.float32, device=device)
+        producer_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(stream):
+            stream.wait_stream(producer_stream)
+            _LORA_A_PTR_DICT.clear()
+            lora_shrink(
+                inputs, lora_a, out,
+                *meta.meta_args(token_nums=M, specialize_active_lora=False),
+                SCALING,
+            )
+        stream.synchronize()
+        return inputs, mapping, out
+
+    def cpu_reference(inputs, mapping):
+        inputs_cpu = inputs.double().cpu()
+        mapping_cpu = mapping.cpu()
+        w_cpu = lora_a[0].double().cpu()
+        ref = torch.zeros((M, RANK), dtype=torch.float64)
+        for lid in range(NUM_ADAPTERS):
+            mask = mapping_cpu == lid
+            if mask.any():
+                ref[mask] = SCALING * (inputs_cpu[mask] @ w_cpu[lid].T)
+        return ref
+
+    # Warm up and capture only on the main/default stream, mirroring how
+    # gpu_model_runner.capture_model warms every graph size on a single
+    # stream before locking.
+    main_stream = torch.cuda.current_stream()
+    run(main_stream, seed=1)
+    lock_workspace()
+
+    # A brand-new stream -- e.g. the MoE shared-experts overlap stream,
+    # which only runs for batch sizes small enough to trigger it and may
+    # never have been exercised during warmup -- must still work the first
+    # time it is used after locking, instead of raising "is locked".
+    aux_stream = torch.cuda.Stream(device=device)
+    raised = False
+    inputs = mapping = out = None
+    try:
+        inputs, mapping, out = run(aux_stream, seed=2)
+    except AssertionError:
+        raised = True
+
+    correct = False
+    if not raised:
+        ref = cpu_reference(inputs, mapping)
+        correct = bool(
+            torch.allclose(out[0].double().cpu(), ref, rtol=0.005, atol=0.005)
+        )
+
+    print(json.dumps({
+        "raised_locked_assertion": raised,
+        "result_correct": correct,
+    }))
+    """
+)
+
+
+def test_lora_shrink_splitk_new_stream_first_use_after_lock():
+    """Regression for the round-3 review's P1 finding: the MoE
+    shared-experts overlap stream only runs for batch sizes small enough to
+    trigger it (VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD), so it may never
+    touch lora_shrink during warmup/capture (which always warms up at each
+    captured graph's own, typically larger, size on the main stream). Its
+    first real use can therefore happen after lock_workspace(), which must
+    not crash.
+    """
+    result = _run(_NEW_STREAM_AFTER_LOCK_SCRIPT, _S8_ENV, timeout=300)
+    print(json.dumps(result, indent=2))
+    assert not result["raised_locked_assertion"], result
+    assert result["result_correct"], result
+
+
+_PROFILING_SCRATCH_RELEASED_SCRIPT = textwrap.dedent(
+    """
+    import json
+    import torch
+    from vllm.lora.ops.triton_ops import lora_shrink
+    from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
+    from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+        lock_workspace,
+        reset_named_workspaces,
+    )
+
+    device = "cuda:0"
+    init_workspace_manager(torch.device(device))
+
+    HIDDEN = 256
+    RANK = 8
+    NUM_ADAPTERS = 2
+    NSLICES = 1
+    SCALING = 1.0
+    DTYPE = torch.bfloat16
+    M = 8
+
+    lora_a = [torch.randn((NUM_ADAPTERS, RANK, HIDDEN), dtype=DTYPE, device=device)]
+
+    def run_on_stream(stream):
+        inputs = torch.randn((M, HIDDEN), dtype=DTYPE, device=device)
+        mapping = torch.randint(
+            0, NUM_ADAPTERS, (M,), dtype=torch.int32, device=device
+        )
+        lora_meta = LoRAKernelMeta.make(
+            max_loras=NUM_ADAPTERS, max_num_tokens=M, device=device
+        )
+        lora_meta.prepare_tensors(mapping)
+        out = torch.zeros((NSLICES, M, RANK), dtype=torch.float32, device=device)
+        producer_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(stream):
+            stream.wait_stream(producer_stream)
+            _LORA_A_PTR_DICT.clear()
+            lora_shrink(
+                inputs, lora_a, out,
+                *lora_meta.meta_args(token_nums=M, specialize_active_lora=False),
+                SCALING,
+            )
+        stream.synchronize()
+
+    # Simulates profile_cudagraph_memory's throwaway stream: used once,
+    # never again.
+    profiling_stream = torch.cuda.Stream(device=device)
+    run_on_stream(profiling_stream)
+
+    manager = current_workspace_manager()
+    owners_before_reset = list(manager._named_workspaces.keys())
+
+    torch.accelerator.synchronize()
+    reset_named_workspaces()
+    owners_after_reset = list(manager._named_workspaces.keys())
+
+    # Real capture proceeds on a different (persistent) stream afterward,
+    # then locks -- unaffected by the earlier reset.
+    capture_stream = torch.cuda.Stream(device=device)
+    run_on_stream(capture_stream)
+    lock_workspace()
+
+    reset_while_locked_raised = False
+    try:
+        reset_named_workspaces()
+    except AssertionError:
+        reset_while_locked_raised = True
+
+    print(json.dumps({
+        "had_owner_before_reset": len(owners_before_reset) == 1,
+        "owner_released_by_reset": owners_after_reset == [],
+        "reset_while_locked_raised": reset_while_locked_raised,
+    }))
+    """
+)
+
+
+def test_lora_shrink_splitk_profiling_scratch_released_by_reset():
+    """Regression for the round-3 review's finding that documenting the
+    retained profiling-stream scratch is not a substitute for actually
+    accounting for / releasing it: reset_named_workspaces(), called from
+    profile_cudagraph_memory's cleanup, must actually free a throwaway
+    profiling stream's named-workspace owner before real capture and lock.
+    """
+    result = _run(_PROFILING_SCRATCH_RELEASED_SCRIPT, _S8_ENV, timeout=300)
+    print(json.dumps(result, indent=2))
+    assert result["had_owner_before_reset"], result
+    assert result["owner_released_by_reset"], result
+    assert result["reset_while_locked_raised"], result
 
 
 # ---------------------------------------------------------------------------

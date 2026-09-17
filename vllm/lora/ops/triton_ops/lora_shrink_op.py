@@ -51,11 +51,16 @@ def _get_two_pass_partials(
     # LoRA-adapted shared-experts layer concurrently with this stream inside
     # the same (ubatch, lane) slot. Without the stream in the key, those two
     # concurrent lora_shrink calls would alias the same scratch buffer.
-    # The tradeoff is that a stream used only transiently (e.g. memory /
-    # graph-memory profiling) keeps its slot allocated for the workspace
-    # manager's lifetime instead of being released after profiling
-    # completes; this is a bounded, minor memory cost, not a correctness
-    # issue.
+    # A stream used only transiently (e.g. memory/graph-memory profiling)
+    # would otherwise keep its slot allocated for the workspace manager's
+    # lifetime; gpu_model_runner.profile_cudagraph_memory releases it via
+    # reset_named_workspaces() once profiling is synchronized, before real
+    # capture and lock_workspace(). A stream that first appears *after*
+    # lock (e.g. the shared-experts stream, which only runs for batch
+    # sizes small enough to trigger it and may not have been exercised
+    # during warmup) still gets its first allocation, since
+    # WorkspaceManager only forbids growing an *existing* per-stream
+    # allocation while locked, not creating a new one.
     (partials,) = current_workspace_manager().get_simultaneous_named(
         ("lora_shrink_two_pass", current_stream()),
         ((num_slices, split_k, m, n), torch.float32),

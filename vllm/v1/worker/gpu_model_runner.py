@@ -233,7 +233,7 @@ from vllm.v1.worker.utils import (
     is_residual_scattered_for_sp,
     raise_if_nan_logits,
 )
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import lock_workspace, reset_named_workspaces
 
 from .utils import (
     AttentionGroup,
@@ -6815,6 +6815,15 @@ class GPUModelRunner(
             self.maybe_remove_all_loras(self.lora_config)
             self._cleanup_profiling_kv_cache()
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
+            # Named-workspace owners keyed by a stream used only for this
+            # profiling pass (e.g. the fresh stream graph_capture() creates
+            # here) would otherwise retain their scratch for the workspace
+            # manager's lifetime, understating the real free memory reported
+            # below. The workspace is not locked yet, so this is safe;
+            # real capture and steady-state execution recreate whatever
+            # they need on their own persistent streams before locking.
+            torch.accelerator.synchronize()
+            reset_named_workspaces()
 
         # FULL and PIECEWISE graphs share the global pool at runtime and are
         # never replayed concurrently, so the pool overlays their memory.

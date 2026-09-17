@@ -117,6 +117,39 @@ class WorkspaceManager:
         """Check if workspace is locked."""
         return self._locked
 
+    def reset_named_workspaces(self) -> None:
+        """Free every named-workspace scratch allocation.
+
+        Named-workspace owners are keyed by (owner, current CUDA stream) so
+        that concurrent streams never alias each other's scratch (see
+        get_simultaneous_named). A stream used only for throwaway work
+        before real capture -- e.g. the fresh stream memory/graph-memory
+        profiling captures on -- gets its own owner entry that nothing ever
+        reuses afterward. Call this once profiling has finished and been
+        synchronized, before capture_model() / lock(), to release that
+        scratch instead of retaining it for the manager's lifetime; real
+        capture and steady-state execution recreate whatever they need on
+        their own (persistent) streams before locking.
+
+        Raises:
+            AssertionError: If the workspace is currently locked, since a
+                captured CUDA graph may already reference this scratch.
+
+        """
+        if self._locked:
+            raise AssertionError(
+                "Cannot reset named workspaces while the workspace is "
+                "locked; a captured CUDA graph may reference this scratch."
+            )
+        if envs.VLLM_DEBUG_WORKSPACE and self._named_workspaces:
+            logger.info(
+                "[WORKSPACE DEBUG] Releasing %d named workspace owner(s): %s",
+                len(self._named_workspaces),
+                list(self._named_workspaces.keys()),
+            )
+        self._named_workspaces.clear()
+        torch.accelerator.empty_cache()
+
     def get_simultaneous(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
     ) -> list[torch.Tensor]:
@@ -187,7 +220,19 @@ class WorkspaceManager:
         current_workspace = slots[workspace_id]
         current_size = self._workspace_size_bytes(current_workspace)
         if current_size < required_bytes:
-            if self._locked:
+            # Only forbid *growing* an existing allocation while locked: a
+            # CUDA graph may already reference it at its current size, so
+            # resizing would move or invalidate that pointer. A slot that
+            # has never been allocated (current_workspace is None) cannot
+            # be referenced by any captured graph yet, so allocating it for
+            # the first time is safe even after locking -- e.g. an owner
+            # keyed by a stream that only appears for batch sizes small
+            # enough to trigger the MoE shared-experts overlap stream
+            # (gated by a token-count threshold) may never have been
+            # exercised during warmup/capture, which always uses larger
+            # batch sizes on that stream, and would otherwise crash on its
+            # first real occurrence in steady-state serving.
+            if self._locked and current_workspace is not None:
                 raise AssertionError(
                     f"Named workspace {owner!r} is locked but requires "
                     f"{required_bytes / _MB:.2f} MB; current size is "
@@ -379,6 +424,16 @@ def unlock_workspace() -> None:
     called again to prevent unexpected allocations.
     """
     current_workspace_manager().unlock()
+
+
+def reset_named_workspaces() -> None:
+    """Free every named-workspace scratch allocation.
+
+    Intended to be called once, after memory/graph-memory profiling has
+    finished and been synchronized but before real CUDA graph capture and
+    lock_workspace(). See WorkspaceManager.reset_named_workspaces.
+    """
+    current_workspace_manager().reset_named_workspaces()
 
 
 def reset_workspace_manager() -> None:
