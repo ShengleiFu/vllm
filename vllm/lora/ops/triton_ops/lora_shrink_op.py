@@ -16,7 +16,7 @@ from vllm.lora.ops.triton_ops.utils import (
     supports_pdl,
 )
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.torch_utils import current_stream, direct_register_custom_op
 from vllm.v1.worker.workspace import current_workspace_manager
 
 # Deterministic split-K for the batch-invariant shrink path. 0 keeps the
@@ -43,15 +43,21 @@ def _get_two_pass_partials(
     output: torch.Tensor, num_slices: int, split_k: int, m: int, n: int
 ) -> torch.Tensor:
     # The runner-owned workspace supplies lifecycle, ubatch isolation, growth
-    # locking, and shutdown cleanup. The owner key intentionally excludes the
-    # current CUDA stream: split-K=8 is rejected at import time whenever LoRA
-    # dual-stream is enabled (see the guard above), so this path never has
-    # two streams needing live scratch concurrently. A single stable owner
-    # also means transient streams used during memory/graph-memory profiling
-    # and the real capture stream reuse the same slot instead of each
-    # permanently retaining their own allocation.
+    # locking, and shutdown cleanup. The owner key must include the current
+    # CUDA stream: rejecting VLLM_LORA_ENABLE_DUAL_STREAM=1 at import time
+    # only rules out *that* mechanism's aux stream. It does not rule out the
+    # independent MoE shared-experts overlap stream (gated by
+    # VLLM_DISABLE_SHARED_EXPERTS_STREAM, on by default), which runs a
+    # LoRA-adapted shared-experts layer concurrently with this stream inside
+    # the same (ubatch, lane) slot. Without the stream in the key, those two
+    # concurrent lora_shrink calls would alias the same scratch buffer.
+    # The tradeoff is that a stream used only transiently (e.g. memory /
+    # graph-memory profiling) keeps its slot allocated for the workspace
+    # manager's lifetime instead of being released after profiling
+    # completes; this is a bounded, minor memory cost, not a correctness
+    # issue.
     (partials,) = current_workspace_manager().get_simultaneous_named(
-        "lora_shrink_two_pass",
+        ("lora_shrink_two_pass", current_stream()),
         ((num_slices, split_k, m, n), torch.float32),
     )
     return partials
