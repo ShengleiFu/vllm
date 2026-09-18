@@ -130,13 +130,6 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         else:
             raise NotImplementedError
 
-        # No-op unless VLLM_LORA_DETERMINISTIC_SPLIT_K is enabled; see
-        # lora_shrink_op.register_shrink_capacity for why this must happen
-        # at weight-construction time.
-        from vllm.lora.ops.triton_ops.lora_shrink_op import register_shrink_capacity
-
-        register_shrink_capacity(self.n_slices, lora_a_out_size)
-
         self.lora_a_stacked = tuple(
             torch.zeros(
                 max_loras,

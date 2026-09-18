@@ -86,11 +86,9 @@ _NUMERIC_SCRIPT = textwrap.dedent(
     from vllm.lora.ops.triton_ops import lora_shrink
     from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
     from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
-    from vllm.v1.worker.workspace import init_workspace_manager
 
     torch.manual_seed(0)
     device = "cuda:0"
-    init_workspace_manager(torch.device(device))
 
     K = {K}
     RANK = {RANK}
@@ -195,10 +193,8 @@ _SELF_BI_SCRIPT = textwrap.dedent(
     from vllm.lora.ops.triton_ops import lora_shrink, lora_expand
     from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
     from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT, _LORA_B_PTR_DICT
-    from vllm.v1.worker.workspace import init_workspace_manager
 
     device = "cuda:0"
-    init_workspace_manager(torch.device(device))
 
     # HIDDEN (=K) is chosen so every one of the 8 fixed splits (BLOCK_K=256)
     # gets at least one nonzero K-block: 2560 / 256 = 10 blocks, so all 8
@@ -405,13 +401,8 @@ _EMPTY_INPUT_SCRIPT = textwrap.dedent(
     from vllm.lora.ops.triton_ops import lora_shrink
     from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
     from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
-    from vllm.v1.worker.workspace import (
-        current_workspace_manager,
-        init_workspace_manager,
-    )
 
     device = "cuda:0"
-    init_workspace_manager(torch.device(device))
 
     HIDDEN = 128
     RANK = 8
@@ -424,7 +415,8 @@ _EMPTY_INPUT_SCRIPT = textwrap.dedent(
 
     results = {}
 
-    # 1. First call with M=0 must not create a named workspace owner.
+    # 1. First call with M=0 must not raise (the empty-input early return
+    # in _lora_shrink skips the two-pass path entirely).
     inputs0 = torch.empty((0, HIDDEN), dtype=DTYPE, device=device)
     out0 = torch.zeros((NSLICES, 0, RANK), dtype=torch.float32, device=device)
     lora_meta0 = LoRAKernelMeta.make(
@@ -437,10 +429,8 @@ _EMPTY_INPUT_SCRIPT = textwrap.dedent(
         *lora_meta0.meta_args(token_nums=0, specialize_active_lora=False),
         SCALING,
     )
-    named_owners_after_empty_call = list(
-        current_workspace_manager()._named_workspaces.keys()
-    )
-    results["m0_no_named_owner_created"] = (named_owners_after_empty_call == [])
+    torch.accelerator.synchronize()
+    results["m0_call_did_not_raise"] = True
 
     # 2. All no-LoRA (M>0 but every row unassigned): workspace IS reserved
     # (per the runner-owned-scratch contract), output stays untouched/zero.
@@ -498,11 +488,12 @@ _EMPTY_INPUT_SCRIPT = textwrap.dedent(
     # only that newly-invalid rows read zero is not enough: the wrapper
     # unconditionally calls output_tensor.zero_() before dispatch, so that
     # much is true even if the reducer never actually rewrites those rows.
-    # Poison the raw named-workspace scratch before the second call (so a
-    # missed write shows up as garbage, not an already-zero value), verify
-    # the newly-*valid* rows against an independent CPU FP64 reference, and
-    # round-trip back to the original mapping to confirm the buffer is
-    # fully rewritten, not merely masked.
+    # Each call's partials come from a fresh torch.empty() (not a reused
+    # buffer), so there is no shared scratch across calls to poison; verify
+    # correctness directly instead: the newly-*valid* rows against an
+    # independent CPU FP64 reference, and a round-trip back to the original
+    # mapping to confirm the second call was legitimately recomputed rather
+    # than coincidentally matching.
     mapping_a = torch.tensor(
         [0, 0, -1, -1, 0, 0, -1, -1] * 2, dtype=torch.int32, device=device
     )
@@ -523,20 +514,6 @@ _EMPTY_INPUT_SCRIPT = textwrap.dedent(
     )
     torch.accelerator.synchronize()
     first_call_snapshot = shared_out.clone()
-
-    # Poison the two-pass named scratch's raw bytes so any row the
-    # reducer fails to (re)write shows up as garbage instead of a
-    # coincidentally-zero value.
-    manager = current_workspace_manager()
-    with torch.inference_mode():
-        # The scratch buffer was allocated inside lora_shrink's own
-        # @torch.inference_mode() context, so it is an inference tensor;
-        # mutating it in place from ordinary (non-inference) code raises
-        # RuntimeError. Poisoning it needs the same mode.
-        for slots in manager._named_workspaces.values():
-            for slot in slots:
-                if slot is not None:
-                    slot.fill_(0xFF)
 
     lora_meta_swap.prepare_tensors(mapping_b)
     _LORA_A_PTR_DICT.clear()
@@ -576,8 +553,7 @@ _EMPTY_INPUT_SCRIPT = textwrap.dedent(
     )
 
     # Round-trip: swap back to mapping_a and confirm the exact original
-    # result reproduces, proving the buffer was legitimately recomputed
-    # both times rather than the poisoning happening to be masked once.
+    # result reproduces, proving both calls were legitimately recomputed.
     lora_meta_swap.prepare_tensors(mapping_a)
     _LORA_A_PTR_DICT.clear()
     lora_shrink(
@@ -603,122 +579,14 @@ def test_lora_shrink_splitk_empty_input_and_no_lora():
 
 
 # ---------------------------------------------------------------------------
-# Workspace owner-key regression: the two-pass scratch's named-workspace
-# owner must be keyed by the current CUDA stream, not just (ubatch, lane).
-# The MoE shared-experts overlap stream (gated by
-# VLLM_DISABLE_SHARED_EXPERTS_STREAM, independent of and on by default
-# regardless of VLLM_LORA_ENABLE_DUAL_STREAM) can run a LoRA-adapted
-# shared-experts layer concurrently with this stream inside the same
-# (ubatch, lane) slot. Two distinct streams must therefore get distinct
-# scratch, even though this means a stream used only transiently (e.g.
-# memory/graph-memory profiling) keeps its slot allocated rather than being
-# reclaimed once real capture starts on a different stream — an accepted,
-# bounded memory cost documented in _get_two_pass_partials.
-# ---------------------------------------------------------------------------
-
-_STREAM_ISOLATION_SCRIPT = textwrap.dedent(
-    """
-    import json
-    import torch
-    from vllm.lora.ops.triton_ops import lora_shrink
-    from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
-    from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
-    from vllm.v1.worker.workspace import (
-        current_workspace_manager,
-        init_workspace_manager,
-    )
-
-    device = "cuda:0"
-    init_workspace_manager(torch.device(device))
-
-    HIDDEN = 256
-    RANK = 8
-    NUM_ADAPTERS = 2
-    NSLICES = 1
-    SCALING = 1.0
-    DTYPE = torch.bfloat16
-    M = 8
-
-    lora_a = [torch.randn((NUM_ADAPTERS, RANK, HIDDEN), dtype=DTYPE, device=device)]
-
-    def run_on_stream(stream):
-        inputs = torch.randn((M, HIDDEN), dtype=DTYPE, device=device)
-        mapping = torch.randint(
-            0, NUM_ADAPTERS, (M,), dtype=torch.int32, device=device
-        )
-        lora_meta = LoRAKernelMeta.make(
-            max_loras=NUM_ADAPTERS, max_num_tokens=M, device=device
-        )
-        lora_meta.prepare_tensors(mapping)
-        out = torch.zeros((NSLICES, M, RANK), dtype=torch.float32, device=device)
-        # Capture the producer stream *before* switching onto `stream` --
-        # torch.cuda.current_stream() called inside the `with` block below
-        # would return `stream` itself, making wait_stream() a no-op
-        # self-wait instead of waiting for inputs/mapping/lora_meta above.
-        producer_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(stream):
-            stream.wait_stream(producer_stream)
-            _LORA_A_PTR_DICT.clear()
-            lora_shrink(
-                inputs, lora_a, out,
-                *lora_meta.meta_args(token_nums=M, specialize_active_lora=False),
-                SCALING,
-            )
-        stream.synchronize()
-
-    # Sequential streams (e.g. memory/graph-memory profiling followed by real
-    # CUDA graph capture), both acting on ubatch 0 / lane 0.
-    profiling_stream = torch.cuda.Stream(device=device)
-    run_on_stream(profiling_stream)
-
-    manager = current_workspace_manager()
-    owner_keys_after_profiling = list(manager._named_workspaces.keys())
-    ptr_after_profiling = (
-        manager._named_workspaces[owner_keys_after_profiling[0]][0].data_ptr()
-    )
-
-    capture_stream = torch.cuda.Stream(device=device)
-    run_on_stream(capture_stream)
-
-    owner_keys_after_capture = list(manager._named_workspaces.keys())
-    capture_key = next(
-        k for k in owner_keys_after_capture if k != owner_keys_after_profiling[0]
-    )
-    ptr_after_capture = manager._named_workspaces[capture_key][0].data_ptr()
-
-    print(json.dumps({
-        "owner_keys_after_profiling": [repr(k) for k in owner_keys_after_profiling],
-        "owner_keys_after_capture": [repr(k) for k in owner_keys_after_capture],
-        "distinct_owner_per_stream": len(owner_keys_after_capture) == 2,
-        "distinct_buffer_per_stream": ptr_after_profiling != ptr_after_capture,
-    }))
-    """
-)
-
-
-def test_lora_shrink_splitk_workspace_owner_isolated_per_stream():
-    """Each distinct CUDA stream must get its own named-workspace scratch
-    slot. A prior implementation collapsed the owner key to (ubatch, lane)
-    only, which reused one slot across streams and let two concurrent
-    lora_shrink calls on different streams (e.g. the MoE shared-experts
-    overlap stream and the main stream) corrupt each other's partials; see
-    test_lora_shrink_splitk_shared_experts_stream_isolation for the
-    concurrent-corruption regression this owner key prevents.
-    """
-    result = _run(_STREAM_ISOLATION_SCRIPT, _S8_ENV)
-    print(json.dumps(result, indent=2))
-    assert result["distinct_owner_per_stream"], result
-    assert result["distinct_buffer_per_stream"], result
-
-
-# ---------------------------------------------------------------------------
-# Concurrent-stream correctness regression (the P1 gap): the MoE
-# shared-experts overlap stream (gated by VLLM_DISABLE_SHARED_EXPERTS_STREAM,
-# independent of VLLM_LORA_ENABLE_DUAL_STREAM and on by default) can run a
-# LoRA-adapted shared-experts layer concurrently with the main stream inside
-# the *same* (ubatch, lane) slot -- unlike test_..._ordinary_concurrent_streams
-# below, which isolates concurrent streams onto separate lanes and therefore
-# does not exercise this same-lane hazard.
+# Concurrent-stream correctness: the MoE shared-experts overlap stream
+# (gated by VLLM_DISABLE_SHARED_EXPERTS_STREAM, independent of
+# VLLM_LORA_ENABLE_DUAL_STREAM and on by default) can run a LoRA-adapted
+# shared-experts layer concurrently with the main stream inside the *same*
+# (ubatch, lane) slot -- unlike test_..._ordinary_concurrent_streams below,
+# which isolates concurrent streams onto separate lanes and therefore does
+# not exercise this same-lane hazard. Each call's torch.empty() allocation
+# is independent, so this must hold regardless.
 # ---------------------------------------------------------------------------
 
 _SHARED_EXPERTS_STREAM_SCRIPT = textwrap.dedent(
@@ -728,10 +596,8 @@ _SHARED_EXPERTS_STREAM_SCRIPT = textwrap.dedent(
     from vllm.lora.ops.triton_ops import lora_shrink
     from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
     from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
-    from vllm.v1.worker.workspace import init_workspace_manager
 
     device = "cuda:0"
-    init_workspace_manager(torch.device(device))
 
     HIDDEN = 2560
     RANK = 16
@@ -760,10 +626,7 @@ _SHARED_EXPERTS_STREAM_SCRIPT = textwrap.dedent(
         return out.clone()
 
     # Mirrors FusedMoE SharedExperts.maybe_forward_async: base work stays on
-    # the main/default stream while a second CUDA stream runs concurrently,
-    # both within the *same* (ubatch, lane) slot -- no use_workspace_lane
-    # separation, since production code has no such separation between the
-    # main stream and the shared-experts overlap stream.
+    # the main/default stream while a second CUDA stream runs concurrently.
     aux_stream = torch.cuda.Stream(device=device)
 
     mismatches = []
@@ -829,288 +692,14 @@ _SHARED_EXPERTS_STREAM_SCRIPT = textwrap.dedent(
 
 
 def test_lora_shrink_splitk_shared_experts_stream_isolation():
-    """Regression for the P1 review finding: without the current stream in
-    the named-workspace owner key, a lora_shrink call on the MoE
-    shared-experts overlap stream and one on the main stream -- both in the
-    same (ubatch, lane) slot, exactly as SharedExperts.maybe_forward_async
-    schedules it regardless of VLLM_LORA_ENABLE_DUAL_STREAM -- alias the
-    same scratch and corrupt each other's partials.
+    """A lora_shrink call on the MoE shared-experts overlap stream and one
+    on the main stream -- both in the same (ubatch, lane) slot, exactly as
+    SharedExperts.maybe_forward_async schedules it regardless of
+    VLLM_LORA_ENABLE_DUAL_STREAM -- must not corrupt each other's partials.
     """
     result = _run(_SHARED_EXPERTS_STREAM_SCRIPT, _S8_ENV, timeout=300)
     print(json.dumps({k: v for k, v in result.items() if k != "mismatches"}, indent=2))
     assert result["all_matched"], result
-
-
-# ---------------------------------------------------------------------------
-# Fixed-capacity registration/reservation regressions (third review round).
-# Incremental per-call growth cannot be made safe under a strict lock: the
-# fix is for every LoRA layer/Punica wrapper to register its largest call
-# shape at weight-construction time, and for reserve_shrink_capacity_for_
-# serving() to allocate the worst case, on every relevant stream, before
-# any CUDA graph capture and before lock_workspace(). The lock itself stays
-# strict -- no "first touch after lock is safe" exception, since work
-# forked onto another stream via CUDA events (as the MoE shared-experts
-# overlap stream does) can be captured into the *same* graph as the main
-# stream.
-# ---------------------------------------------------------------------------
-
-_CAPACITY_LIFECYCLE_SCRIPT = textwrap.dedent(
-    """
-    import json
-    import torch
-    from vllm.lora.ops.triton_ops import lora_shrink
-    import vllm.lora.ops.triton_ops.lora_shrink_op as lora_shrink_op
-    from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
-    from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
-    from vllm.utils.torch_utils import aux_stream as get_aux_stream
-    from vllm.v1.worker.workspace import init_workspace_manager, lock_workspace
-
-    device = "cuda:0"
-    init_workspace_manager(torch.device(device))
-
-    HIDDEN = 2560
-    NUM_ADAPTERS = 2
-    SCALING = 0.9
-    DTYPE = torch.bfloat16
-    # Mirrors a QKV layer (3 slices, small rank) feeding into a row-projection
-    # layer (1 slice, larger rank) on the *same* owner/stream -- the review's
-    # concrete example of why maxing each dimension independently is wrong
-    # (3*16=48 vs 1*64=64; the true bound is max(48,64), not 3*64).
-    QKV_SLICES, QKV_RANK = 3, 16
-    ROW_SLICES, ROW_RANK = 1, 64
-    M_SMALL, M_LARGE = 32, 256
-
-    def run(stream, m, rank, n_slices, seed):
-        g = torch.Generator(device=device).manual_seed(seed)
-        lora_a = [
-            torch.randn((NUM_ADAPTERS, rank, HIDDEN), dtype=DTYPE, device=device,
-                        generator=g)
-            for _ in range(n_slices)
-        ]
-        inputs = torch.randn((m, HIDDEN), dtype=DTYPE, device=device, generator=g)
-        mapping = torch.randint(
-            0, NUM_ADAPTERS, (m,), dtype=torch.int32, device=device, generator=g
-        )
-        meta = LoRAKernelMeta.make(max_loras=NUM_ADAPTERS, max_num_tokens=m,
-                                     device=device)
-        meta.prepare_tensors(mapping)
-        out = torch.zeros((n_slices, m, rank), dtype=torch.float32, device=device)
-        producer_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(stream):
-            stream.wait_stream(producer_stream)
-            _LORA_A_PTR_DICT.clear()
-            lora_shrink(
-                inputs, lora_a, out,
-                *meta.meta_args(token_nums=m, specialize_active_lora=False),
-                SCALING,
-            )
-        stream.synchronize()
-        return lora_a, inputs, mapping, out
-
-    def cpu_reference(lora_a, inputs, mapping, n_slices, rank):
-        inputs_cpu = inputs.double().cpu()
-        mapping_cpu = mapping.cpu()
-        ref = torch.zeros((n_slices, inputs.size(0), rank), dtype=torch.float64)
-        for s in range(n_slices):
-            w_cpu = lora_a[s].double().cpu()
-            for lid in range(NUM_ADAPTERS):
-                mask = mapping_cpu == lid
-                if mask.any():
-                    ref[s, mask] = SCALING * (inputs_cpu[mask] @ w_cpu[lid].T)
-        return ref
-
-    results = {}
-
-    # --- Scenario A: without registration, strict lock rejects a stream's
-    # first touch after lock (documents the hazard the mechanism protects
-    # against; this is the *correct*, safe failure mode, not a bug). ---
-    main_stream = torch.cuda.current_stream()
-    run(main_stream, M_SMALL, QKV_RANK, QKV_SLICES, seed=1)
-    lock_workspace()
-    random_new_stream = torch.cuda.Stream(device=device)
-    try:
-        run(random_new_stream, M_SMALL, QKV_RANK, QKV_SLICES, seed=2)
-        results["unregistered_new_stream_after_lock_raised"] = False
-    except AssertionError:
-        results["unregistered_new_stream_after_lock_raised"] = True
-
-    # Fresh manager for the properly-registered scenarios below.
-    init_workspace_manager(torch.device(device))
-    lora_shrink_op._registered_max_product = 0
-    lora_shrink_op._registered_max_m = 0
-    lora_shrink_op._capacity_reserved = False
-
-    # --- Scenario B: register every supported shape (QKV and row, at the
-    # largest token count) up front, then reserve, *then* lock. The real
-    # MoE shared-experts overlap stream (the actual global singleton
-    # reserve_shrink_capacity_for_serving() targets, not an arbitrary new
-    # stream) never touched lora_shrink before lock, and still works on
-    # its first real use; growing from a small captured shape (QKV at
-    # M_SMALL) to a larger one (row at M_LARGE) on the *same* stream also
-    # works, since capacity was sized for the worst case, not whatever
-    # happened to run first. ---
-    lora_shrink_op.register_shrink_capacity(QKV_SLICES, QKV_RANK)
-    lora_shrink_op.register_shrink_capacity(ROW_SLICES, ROW_RANK)
-    lora_shrink_op.register_shrink_token_capacity(M_LARGE)
-    lora_shrink_op.reserve_shrink_capacity_for_serving()
-
-    qkv_a, qkv_in, qkv_map, qkv_out = run(
-        main_stream, M_SMALL, QKV_RANK, QKV_SLICES, seed=3
-    )
-    lock_workspace()
-
-    row_a, row_in, row_map, row_out = run(
-        main_stream, M_LARGE, ROW_RANK, ROW_SLICES, seed=4
-    )
-    results["cross_shape_growth_after_lock_ok"] = True  # no exception raised
-
-    aux_stream = get_aux_stream()
-    aux_a, aux_in, aux_map, aux_out = run(
-        aux_stream, M_SMALL, QKV_RANK, QKV_SLICES, seed=5
-    )
-    results["registered_new_stream_after_lock_ok"] = True
-
-    qkv_ref = cpu_reference(qkv_a, qkv_in, qkv_map, QKV_SLICES, QKV_RANK)
-    row_ref = cpu_reference(row_a, row_in, row_map, ROW_SLICES, ROW_RANK)
-    aux_ref = cpu_reference(aux_a, aux_in, aux_map, QKV_SLICES, QKV_RANK)
-    results["qkv_correct"] = bool(
-        torch.allclose(qkv_out.double().cpu(), qkv_ref, rtol=0.005, atol=0.005)
-    )
-    results["row_correct"] = bool(
-        torch.allclose(row_out.double().cpu(), row_ref, rtol=0.005, atol=0.005)
-    )
-    results["aux_correct"] = bool(
-        torch.allclose(aux_out.double().cpu(), aux_ref, rtol=0.005, atol=0.005)
-    )
-
-    # --- Scenario C: a call whose shape exceeds what was registered must
-    # be rejected before launch, with a clear error -- not silently
-    # truncated/misdirected. ---
-    try:
-        run(main_stream, M_LARGE * 2, ROW_RANK, ROW_SLICES, seed=6)
-        results["oversized_call_rejected"] = False
-    except RuntimeError as e:
-        results["oversized_call_rejected"] = "exceeding" in str(e)
-
-    print(json.dumps(results))
-    """
-)
-
-
-def test_lora_shrink_splitk_capacity_registration_lifecycle():
-    """Covers the third review round's minimal regression plan:
-    unregistered new-stream-after-lock still fails safely (strict lock,
-    no exception carved out); registering every supported shape (small
-    QKV-like and larger row-like, at the true max token count) and
-    reserving before lock lets both cross-shape growth *and* a
-    never-before-seen stream succeed after lock, correctly; and a call
-    exceeding registered capacity is rejected before launch instead of
-    silently truncated.
-    """
-    result = _run(_CAPACITY_LIFECYCLE_SCRIPT, _S8_ENV, timeout=300)
-    print(json.dumps(result, indent=2))
-    assert result["unregistered_new_stream_after_lock_raised"], result
-    assert result["cross_shape_growth_after_lock_ok"], result
-    assert result["registered_new_stream_after_lock_ok"], result
-    assert result["qkv_correct"], result
-    assert result["row_correct"], result
-    assert result["aux_correct"], result
-    assert result["oversized_call_rejected"], result
-
-
-_PROFILING_SCRATCH_RELEASED_SCRIPT = textwrap.dedent(
-    """
-    import json
-    import torch
-    from vllm.lora.ops.triton_ops import lora_shrink
-    from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
-    from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
-    from vllm.v1.worker.workspace import (
-        current_workspace_manager,
-        init_workspace_manager,
-        lock_workspace,
-        reset_named_workspaces,
-    )
-
-    device = "cuda:0"
-    init_workspace_manager(torch.device(device))
-
-    HIDDEN = 256
-    RANK = 8
-    NUM_ADAPTERS = 2
-    NSLICES = 1
-    SCALING = 1.0
-    DTYPE = torch.bfloat16
-    M = 8
-
-    lora_a = [torch.randn((NUM_ADAPTERS, RANK, HIDDEN), dtype=DTYPE, device=device)]
-
-    def run_on_stream(stream):
-        inputs = torch.randn((M, HIDDEN), dtype=DTYPE, device=device)
-        mapping = torch.randint(
-            0, NUM_ADAPTERS, (M,), dtype=torch.int32, device=device
-        )
-        lora_meta = LoRAKernelMeta.make(
-            max_loras=NUM_ADAPTERS, max_num_tokens=M, device=device
-        )
-        lora_meta.prepare_tensors(mapping)
-        out = torch.zeros((NSLICES, M, RANK), dtype=torch.float32, device=device)
-        producer_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(stream):
-            stream.wait_stream(producer_stream)
-            _LORA_A_PTR_DICT.clear()
-            lora_shrink(
-                inputs, lora_a, out,
-                *lora_meta.meta_args(token_nums=M, specialize_active_lora=False),
-                SCALING,
-            )
-        stream.synchronize()
-
-    # Simulates profile_cudagraph_memory's throwaway stream: used once,
-    # never again.
-    profiling_stream = torch.cuda.Stream(device=device)
-    run_on_stream(profiling_stream)
-
-    manager = current_workspace_manager()
-    owners_before_reset = list(manager._named_workspaces.keys())
-
-    torch.accelerator.synchronize()
-    reset_named_workspaces()
-    owners_after_reset = list(manager._named_workspaces.keys())
-
-    # Real capture proceeds on a different (persistent) stream afterward,
-    # then locks -- unaffected by the earlier reset.
-    capture_stream = torch.cuda.Stream(device=device)
-    run_on_stream(capture_stream)
-    lock_workspace()
-
-    reset_while_locked_raised = False
-    try:
-        reset_named_workspaces()
-    except AssertionError:
-        reset_while_locked_raised = True
-
-    print(json.dumps({
-        "had_owner_before_reset": len(owners_before_reset) == 1,
-        "owner_released_by_reset": owners_after_reset == [],
-        "reset_while_locked_raised": reset_while_locked_raised,
-    }))
-    """
-)
-
-
-def test_lora_shrink_splitk_profiling_scratch_released_by_reset():
-    """Regression for the round-3 review's finding that documenting the
-    retained profiling-stream scratch is not a substitute for actually
-    accounting for / releasing it: reset_named_workspaces(), called from
-    profile_cudagraph_memory's cleanup, must actually free a throwaway
-    profiling stream's named-workspace owner before real capture and lock.
-    """
-    result = _run(_PROFILING_SCRATCH_RELEASED_SCRIPT, _S8_ENV, timeout=300)
-    print(json.dumps(result, indent=2))
-    assert result["had_owner_before_reset"], result
-    assert result["owner_released_by_reset"], result
-    assert result["reset_while_locked_raised"], result
 
 
 # ---------------------------------------------------------------------------
@@ -1248,10 +837,8 @@ _EFFECTIVE_LAUNCH_SCRIPT = textwrap.dedent(
     from vllm.lora.ops.triton_ops import lora_shrink
     from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
     from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
-    from vllm.v1.worker.workspace import init_workspace_manager
 
     device = "cuda:0"
-    init_workspace_manager(torch.device(device))
 
     K, RANK, NSLICES, NUM_LORAS, M = 2560, 8, 3, 2, 5
     DTYPE = torch.bfloat16
@@ -1420,10 +1007,12 @@ def test_lora_shrink_default_path_unaffected(batch_invariant):
 
 
 # ---------------------------------------------------------------------------
-# CUDA Graph capture/replay: the padded-capacity scratch address must stay
-# stable across replays, replaying with different (legal) inputs/metadata
-# must match a fresh eager run of that same input, and restoring the
-# original inputs must reproduce the original result exactly.
+# CUDA Graph capture/replay: replaying with different (legal) inputs/
+# metadata must match a fresh eager run of that same input, restoring the
+# original inputs must reproduce the original result exactly, and an
+# unrelated, larger eager call on the same stream after capture must not
+# corrupt the captured graph's own scratch (each graph's torch.empty()
+# allocation lives in that graph's own private CUDA-graph memory pool).
 # ---------------------------------------------------------------------------
 
 _GRAPH_SCRIPT = textwrap.dedent(
@@ -1433,14 +1022,8 @@ _GRAPH_SCRIPT = textwrap.dedent(
     from vllm.lora.ops.triton_ops import lora_shrink
     from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
     from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
-    from vllm.v1.worker.workspace import (
-        current_workspace_manager,
-        init_workspace_manager,
-        lock_workspace,
-    )
 
     device = "cuda:0"
-    init_workspace_manager(torch.device(device))
 
     HIDDEN = 2560
     RANK = 16
@@ -1449,52 +1032,45 @@ _GRAPH_SCRIPT = textwrap.dedent(
     SCALING = 0.6
     DTYPE = torch.bfloat16
     M_CAP = 96
+    M_LARGE = 256  # a later, larger eager call on the same stream -- must
+                   # not disturb the M_CAP graph's own scratch (each graph
+                   # gets its own private CUDA-graph memory pool).
 
-    def make_mapping(seed):
-        g = torch.Generator(device=device).manual_seed(seed)
+    def make_mapping(m, seed, generator=None):
+        g = generator or torch.Generator(device=device).manual_seed(seed)
         return torch.randint(
-            0, NUM_ADAPTERS, (M_CAP,), dtype=torch.int32, device=device, generator=g
+            0, NUM_ADAPTERS, (m,), dtype=torch.int32, device=device, generator=g
         )
 
     lora_a = [torch.randn((NUM_ADAPTERS, RANK, HIDDEN), dtype=DTYPE, device=device)]
 
-    def eager_reference(inputs, mapping):
-        out = torch.zeros(
-            (NSLICES, M_CAP, RANK), dtype=torch.float32, device=device
-        )
-        meta = LoRAKernelMeta.make(
-            max_loras=NUM_ADAPTERS, max_num_tokens=M_CAP, device=device
-        )
+    def eager_reference(inputs, mapping, m):
+        out = torch.zeros((NSLICES, m, RANK), dtype=torch.float32, device=device)
+        meta = LoRAKernelMeta.make(max_loras=NUM_ADAPTERS, max_num_tokens=m,
+                                     device=device)
         meta.prepare_tensors(mapping)
         _LORA_A_PTR_DICT.clear()
         lora_shrink(
             inputs, lora_a, out,
-            *meta.meta_args(token_nums=M_CAP, specialize_active_lora=False),
+            *meta.meta_args(token_nums=m, specialize_active_lora=False),
             SCALING,
         )
         torch.accelerator.synchronize()
         return out.clone()
 
     original_inputs = torch.randn((M_CAP, HIDDEN), dtype=DTYPE, device=device)
-    original_mapping = make_mapping(1)
-    original_reference = eager_reference(original_inputs, original_mapping)
+    original_mapping = make_mapping(M_CAP, seed=1)
+    original_reference = eager_reference(original_inputs, original_mapping, M_CAP)
 
     static_inputs = torch.zeros((M_CAP, HIDDEN), dtype=DTYPE, device=device)
-    static_out = torch.zeros(
-        (NSLICES, M_CAP, RANK), dtype=torch.float32, device=device
-    )
+    static_out = torch.zeros((NSLICES, M_CAP, RANK), dtype=torch.float32,
+                               device=device)
     static_inputs.copy_(original_inputs)
-    lora_meta = LoRAKernelMeta.make(
-        max_loras=NUM_ADAPTERS, max_num_tokens=M_CAP, device=device
-    )
+    lora_meta = LoRAKernelMeta.make(max_loras=NUM_ADAPTERS, max_num_tokens=M_CAP,
+                                      device=device)
     lora_meta.prepare_tensors(original_mapping)
 
-    # Warmup on a side stream (required before capture), then lock so the
-    # scratch address cannot move once the graph references it. Real capture
-    # (gpu_model_runner.capture_model) warms up and captures every shape on
-    # the *same* graph_capture() stream before locking the workspace
-    # afterward; mirror that here by explicitly capturing on warmup_stream
-    # too, since the named-workspace owner key now includes the stream.
+    # Warmup on a side stream (required before capture).
     warmup_stream = torch.cuda.Stream(device=device)
     warmup_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup_stream):
@@ -1508,11 +1084,6 @@ _GRAPH_SCRIPT = textwrap.dedent(
     torch.cuda.current_stream().wait_stream(warmup_stream)
     torch.accelerator.synchronize()
 
-    manager = current_workspace_manager()
-    owner_key = ("lora_shrink_two_pass", warmup_stream)
-    ptr_before_lock = manager._named_workspaces[owner_key][0].data_ptr()
-    lock_workspace()
-
     graph = torch.cuda.CUDAGraph()
     _LORA_A_PTR_DICT.clear()
     with torch.cuda.graph(graph, stream=warmup_stream):
@@ -1522,8 +1093,7 @@ _GRAPH_SCRIPT = textwrap.dedent(
             SCALING,
         )
 
-    ptr_after_capture = manager._named_workspaces[owner_key][0].data_ptr()
-    results = {"ptr_stable_through_capture": ptr_before_lock == ptr_after_capture}
+    results = {}
 
     # Replay 0: unchanged inputs/metadata -- must match the original eager
     # reference exactly.
@@ -1533,11 +1103,21 @@ _GRAPH_SCRIPT = textwrap.dedent(
         torch.equal(static_out, original_reference)
     )
 
+    # A larger, unrelated eager call on the *same* stream, after the graph
+    # was captured -- this is the scenario every earlier round's named,
+    # incrementally-grown scratch pool could not make safe under a lock.
+    # With a fresh per-call torch.empty() and each CUDA graph owning its
+    # own private memory pool, this must not disturb the captured graph.
+    large_inputs = torch.randn((M_LARGE, HIDDEN), dtype=DTYPE, device=device)
+    large_mapping = make_mapping(M_LARGE, seed=99)
+    with torch.cuda.stream(warmup_stream):
+        eager_reference(large_inputs, large_mapping, M_LARGE)
+
     # Replay 1: swap in different, still-legal inputs and metadata (no
     # recapture) and compare against a fresh eager run of that same input.
     new_inputs = torch.randn((M_CAP, HIDDEN), dtype=DTYPE, device=device)
-    new_mapping = make_mapping(2)
-    new_reference = eager_reference(new_inputs, new_mapping)
+    new_mapping = make_mapping(M_CAP, seed=2)
+    new_reference = eager_reference(new_inputs, new_mapping, M_CAP)
     static_inputs.copy_(new_inputs)
     lora_meta.prepare_tensors(new_mapping)
     graph.replay()
@@ -1545,11 +1125,10 @@ _GRAPH_SCRIPT = textwrap.dedent(
     results["replay1_matches_fresh_eager"] = bool(
         torch.equal(static_out, new_reference)
     )
-    ptr_after_replay1 = manager._named_workspaces[owner_key][0].data_ptr()
-    results["ptr_stable_through_replay1"] = ptr_before_lock == ptr_after_replay1
 
     # Replay 2: restore the original inputs/metadata and confirm the graph
-    # reproduces the original reference again (no accumulated state leak).
+    # reproduces the original reference again (no accumulated state leak,
+    # and no corruption from the larger eager call in between).
     static_inputs.copy_(original_inputs)
     lora_meta.prepare_tensors(original_mapping)
     graph.replay()
@@ -1557,8 +1136,6 @@ _GRAPH_SCRIPT = textwrap.dedent(
     results["replay2_restored_matches_original"] = bool(
         torch.equal(static_out, original_reference)
     )
-    ptr_after_replay2 = manager._named_workspaces[owner_key][0].data_ptr()
-    results["ptr_stable_through_replay2"] = ptr_before_lock == ptr_after_replay2
 
     print(json.dumps(results))
     """
@@ -1574,9 +1151,11 @@ def test_lora_shrink_splitk_cuda_graph_capture_replay():
 
 # ---------------------------------------------------------------------------
 # Ordinary concurrent CUDA streams (not the LoRA dual-stream/PDL feature,
-# which split-K=8 explicitly rejects at init): two plain streams on two
-# distinct workspace lanes must not alias each other's scratch and must each
-# match their own serial reference.
+# which split-K=8 explicitly rejects at init): two plain streams running
+# concurrently must not alias each other's scratch and must each match
+# their own serial reference. Each call's torch.empty() allocation is
+# independent, so aliasing cannot happen structurally; this exercises it
+# under real concurrency anyway.
 # ---------------------------------------------------------------------------
 
 _CONCURRENT_STREAMS_SCRIPT = textwrap.dedent(
@@ -1586,14 +1165,8 @@ _CONCURRENT_STREAMS_SCRIPT = textwrap.dedent(
     from vllm.lora.ops.triton_ops import lora_shrink
     from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
     from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
-    from vllm.v1.worker.workspace import (
-        current_workspace_manager,
-        init_workspace_manager,
-        use_workspace_lane,
-    )
 
     device = "cuda:0"
-    init_workspace_manager(torch.device(device), num_ubatches=1, num_lanes=2)
 
     HIDDEN = 2560
     RANK = 16
@@ -1624,8 +1197,6 @@ _CONCURRENT_STREAMS_SCRIPT = textwrap.dedent(
     stream0 = torch.cuda.Stream(device=device)
     stream1 = torch.cuda.Stream(device=device)
 
-    manager = current_workspace_manager()
-    lane_ptrs = {}
     mismatches = []
     for round_idx in range(ROUNDS):
         g = torch.Generator(device=device).manual_seed(1000 + round_idx)
@@ -1653,7 +1224,7 @@ _CONCURRENT_STREAMS_SCRIPT = textwrap.dedent(
         out1 = torch.zeros((NSLICES, M, RANK), dtype=torch.float32, device=device)
 
         main_stream = torch.cuda.current_stream()
-        with use_workspace_lane(0), torch.cuda.stream(stream0):
+        with torch.cuda.stream(stream0):
             # inputs0/mapping0/meta0 were built on the main stream above;
             # without this wait, stream0 could launch before those writes
             # are visible to it.
@@ -1664,21 +1235,13 @@ _CONCURRENT_STREAMS_SCRIPT = textwrap.dedent(
                 *meta0.meta_args(token_nums=M, specialize_active_lora=False),
                 SCALING,
             )
-            lane_ptrs[0] = (
-                manager._named_workspaces[("lora_shrink_two_pass", stream0)][0]
-                .data_ptr()
-            )
-        with use_workspace_lane(1), torch.cuda.stream(stream1):
+        with torch.cuda.stream(stream1):
             stream1.wait_stream(main_stream)
             _LORA_A_PTR_DICT.clear()
             lora_shrink(
                 inputs1, lora_a, out1,
                 *meta1.meta_args(token_nums=M, specialize_active_lora=False),
                 SCALING,
-            )
-            lane_ptrs[1] = (
-                manager._named_workspaces[("lora_shrink_two_pass", stream1)][1]
-                .data_ptr()
             )
 
         stream0.synchronize()
@@ -1690,12 +1253,6 @@ _CONCURRENT_STREAMS_SCRIPT = textwrap.dedent(
             mismatches.append(f"round {round_idx} lane1 mismatch")
 
     print(json.dumps({
-        "lanes_non_aliasing": lane_ptrs[0] != lane_ptrs[1],
-        # One owner entry per distinct stream: run_serial's reference calls
-        # use the main/current stream, and stream0/stream1 each get their
-        # own -- three total, not one per round (100 rounds reuse the same
-        # three streams throughout).
-        "owner_slot_count_bounded": len(manager._named_workspaces) == 3,
         "mismatches": mismatches,
         "all_matched": len(mismatches) == 0,
     }))
@@ -1706,6 +1263,99 @@ _CONCURRENT_STREAMS_SCRIPT = textwrap.dedent(
 def test_lora_shrink_splitk_ordinary_concurrent_streams():
     result = _run(_CONCURRENT_STREAMS_SCRIPT, _S8_ENV, timeout=300)
     print(json.dumps({k: v for k, v in result.items() if k != "mismatches"}, indent=2))
-    assert result["lanes_non_aliasing"], result
-    assert result["owner_slot_count_bounded"], result
     assert result["all_matched"], result["mismatches"]
+
+
+# ---------------------------------------------------------------------------
+# Engine restart within one process: torch.empty() per call leaves no
+# mutable module-level state (no registered capacities, no named
+# workspaces) for a later "engine" run in the same process to inherit
+# stale values from. The only module-level state is _TWO_PASS_SPLIT_K,
+# a constant read once from the env at import time -- fixed for the
+# process lifetime, same as any other env-gated vLLM flag.
+# ---------------------------------------------------------------------------
+
+_ENGINE_RESTART_SCRIPT = textwrap.dedent(
+    """
+    import gc
+    import json
+    import torch
+    from vllm.lora.ops.triton_ops import lora_shrink
+    from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
+    from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
+
+    device = "cuda:0"
+    DTYPE = torch.bfloat16
+    SCALING = 0.6
+
+    def run_engine(hidden, rank, num_adapters, m, seed):
+        g = torch.Generator(device=device).manual_seed(seed)
+        lora_a = [
+            torch.randn(
+                (num_adapters, rank, hidden), dtype=DTYPE, device=device, generator=g
+            )
+        ]
+        inputs = torch.randn((m, hidden), dtype=DTYPE, device=device, generator=g)
+        mapping = torch.randint(
+            0, num_adapters, (m,), dtype=torch.int32, device=device, generator=g
+        )
+        out = torch.zeros((1, m, rank), dtype=torch.float32, device=device)
+        meta = LoRAKernelMeta.make(max_loras=num_adapters, max_num_tokens=m,
+                                     device=device)
+        meta.prepare_tensors(mapping)
+        _LORA_A_PTR_DICT.clear()
+        lora_shrink(
+            inputs, lora_a, out,
+            *meta.meta_args(token_nums=m, specialize_active_lora=False),
+            SCALING,
+        )
+        torch.accelerator.synchronize()
+
+        ref = torch.zeros((m, rank), dtype=torch.float64)
+        inputs_cpu = inputs.double().cpu()
+        mapping_cpu = mapping.cpu()
+        w_cpu = lora_a[0].double().cpu()
+        for lid in range(num_adapters):
+            mask = mapping_cpu == lid
+            if mask.any():
+                ref[mask] = SCALING * (inputs_cpu[mask] @ w_cpu[lid].T)
+        return bool(torch.allclose(out[0].double().cpu(), ref, rtol=0.005, atol=0.005))
+
+    # "Engine A": one shape/adapter-count combination.
+    engine_a_ok = run_engine(hidden=2560, rank=8, num_adapters=3, m=64, seed=1)
+
+    # Simulate an in-process engine restart: drop every Python reference an
+    # engine held (weights, mapping, metadata) and force collection, exactly
+    # like tearing down an LLMEngine and constructing a new one without
+    # exiting the process.
+    gc.collect()
+    torch.accelerator.empty_cache()
+
+    # "Engine B": a different shape/adapter-count combination, as a fresh
+    # engine would pick based on its own model/config.
+    engine_b_ok = run_engine(hidden=4096, rank=32, num_adapters=5, m=300, seed=2)
+
+    # Re-run engine A's exact configuration once more, after engine B, to
+    # confirm nothing engine B did (including its own scratch allocations)
+    # corrupted a result shape/pattern engine A also uses.
+    engine_a_again_ok = run_engine(hidden=2560, rank=8, num_adapters=3, m=64, seed=3)
+
+    print(json.dumps({
+        "engine_a_correct": engine_a_ok,
+        "engine_b_correct_after_restart": engine_b_ok,
+        "engine_a_shape_correct_again_after_b": engine_a_again_ok,
+    }))
+    """
+)
+
+
+def test_lora_shrink_splitk_engine_restart_in_process():
+    """Regression for the round-6 review's process-restart finding: the old
+    registration/reservation scheme left mutable module-level capacity state
+    that a second engine instance in the same process could inherit stale.
+    torch.empty() per call has no such state to leak.
+    """
+    result = _run(_ENGINE_RESTART_SCRIPT, _S8_ENV, timeout=300)
+    print(json.dumps(result, indent=2))
+    failures = [name for name, ok in result.items() if not ok]
+    assert not failures, f"failed checks: {failures}; full result: {result}"

@@ -37,14 +37,6 @@ class ClassificationHeadWithLoRA(ReplicatedLinearWithLoRA):
         self.full_module_enabled = torch.zeros(
             max_loras, dtype=torch.bool, device=self.device
         )
-        # No-op unless VLLM_LORA_DETERMINISTIC_SPLIT_K is enabled.
-        # apply_lora_full_linear's shrink call uses num_slices=1 and N =
-        # this layer's full output width, not a LoRA rank -- a separate
-        # shape from the ordinary LoRA A/B path registered by the
-        # super().create_lora_weights() call above.
-        from vllm.lora.ops.triton_ops.lora_shrink_op import register_shrink_capacity
-
-        register_shrink_capacity(1, self.output_size)
 
     def reset_module_to_save(self, index: int) -> None:
         self.full_weight_stacked[index].zero_()
