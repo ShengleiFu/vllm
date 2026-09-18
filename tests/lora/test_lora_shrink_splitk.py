@@ -1108,9 +1108,9 @@ _GRAPH_SCRIPT = textwrap.dedent(
     # incrementally-grown scratch pool could not make safe under a lock.
     # With a fresh per-call torch.empty() and each CUDA graph owning its
     # own private memory pool, this must not disturb the captured graph.
-    large_inputs = torch.randn((M_LARGE, HIDDEN), dtype=DTYPE, device=device)
-    large_mapping = make_mapping(M_LARGE, seed=99)
     with torch.cuda.stream(warmup_stream):
+        large_inputs = torch.randn((M_LARGE, HIDDEN), dtype=DTYPE, device=device)
+        large_mapping = make_mapping(M_LARGE, seed=99)
         eager_reference(large_inputs, large_mapping, M_LARGE)
 
     # Replay 1: swap in different, still-legal inputs and metadata (no
