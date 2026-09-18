@@ -59,6 +59,7 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping, LoRAMappingType
+from vllm.lora.ops.triton_ops.lora_shrink_op import reserve_shrink_capacity_for_serving
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -6819,9 +6820,11 @@ class GPUModelRunner(
             # profiling pass (e.g. the fresh stream graph_capture() creates
             # here) would otherwise retain their scratch for the workspace
             # manager's lifetime, understating the real free memory reported
-            # below. The workspace is not locked yet, so this is safe;
-            # real capture and steady-state execution recreate whatever
-            # they need on their own persistent streams before locking.
+            # below. The workspace is not locked yet, so this is safe: every
+            # owner this releases is recreated at its full registered
+            # capacity by capture_model()'s reserve_shrink_capacity_for_
+            # serving() call before capture (and before locking), so
+            # nothing here needs to survive past this point.
             torch.accelerator.synchronize()
             reset_named_workspaces()
 
@@ -6849,6 +6852,14 @@ class GPUModelRunner(
                 "ensure `cudagraph_mode` was not manually set to `NONE`"
             )
             return 0
+
+        # Every LoRA layer/Punica wrapper has already registered its
+        # largest split-K shrink call shape by now (weight/wrapper
+        # construction happens during model load, before capture). Reserve
+        # that worst-case scratch, on every stream the op can be dispatched
+        # from, before any graph capture below can reference it -- a no-op
+        # unless VLLM_LORA_DETERMINISTIC_SPLIT_K is enabled.
+        reserve_shrink_capacity_for_serving()
 
         # Initialize encoder CUDA graph manager if enabled.
         self._maybe_init_encoder_cudagraph_manager()

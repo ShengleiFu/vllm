@@ -184,39 +184,21 @@ def test_named_workspace_lock_blocks_growth_and_allows_reuse(monkeypatch) -> Non
     with pytest.raises(AssertionError, match="is locked"):
         manager.get_simultaneous_named("owner", ((512,), torch.uint8))
 
+    # A different owner requested for the first time while locked must also
+    # fail loudly instead of silently allocating: locking is strict, with no
+    # "first touch is safe" exception. Work forked onto another stream via
+    # CUDA events (as the MoE shared-experts overlap stream does) can be
+    # captured into the *same* CUDA graph as the main stream, so even a
+    # stream/owner never touched before can already be graph-referenced by
+    # the time the workspace locks. Callers that need scratch on a given
+    # stream after lock must reserve it before locking (see
+    # lora_shrink_op.reserve_shrink_capacity_for_serving).
+    with pytest.raises(AssertionError, match="is locked"):
+        manager.get_simultaneous_named("brand_new_owner", ((8,), torch.uint8))
+
     manager.unlock()
     (grown,) = manager.get_simultaneous_named("owner", ((512,), torch.uint8))
     assert grown.numel() == 512
-
-
-def test_named_workspace_lock_allows_first_allocation_of_new_owner(
-    monkeypatch,
-) -> None:
-    """A brand-new owner key must be allocatable even while locked.
-
-    Locking exists to keep an *already-captured* CUDA graph's scratch
-    pointer stable, not to forbid every allocation while locked. An owner
-    keyed by a stream that has never been used before (e.g. the MoE
-    shared-experts overlap stream, which only runs for batch sizes small
-    enough to trigger it, and may not have been exercised during warmup)
-    cannot yet be referenced by any captured graph, so its first
-    allocation is safe. Once that owner has an allocation, growing it
-    further while locked is still forbidden.
-    """
-    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
-    manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=1)
-
-    manager.lock()
-    assert manager.is_locked()
-
-    (first,) = manager.get_simultaneous_named("brand_new_owner", ((8,), torch.uint8))
-    assert first.numel() == 8
-
-    (same,) = manager.get_simultaneous_named("brand_new_owner", ((8,), torch.uint8))
-    assert same.data_ptr() == first.data_ptr()
-
-    with pytest.raises(AssertionError, match="is locked"):
-        manager.get_simultaneous_named("brand_new_owner", ((512,), torch.uint8))
 
 
 def test_named_workspace_reset_named_workspaces_frees_scratch(monkeypatch) -> None:

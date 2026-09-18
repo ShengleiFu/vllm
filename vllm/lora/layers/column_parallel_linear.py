@@ -221,6 +221,15 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             else divide(lora_config.max_lora_rank, self.tp_size)
         )
 
+        # No-op unless VLLM_LORA_DETERMINISTIC_SPLIT_K is enabled; see
+        # lora_shrink_op.register_shrink_capacity for why this must happen
+        # at weight-construction time. Covers MergedColumnParallelLinear,
+        # QKVParallelLinear, and MergedQKVParallelLinear, which all reach
+        # this method (directly or via super().create_lora_weights()).
+        from vllm.lora.ops.triton_ops.lora_shrink_op import register_shrink_capacity
+
+        register_shrink_capacity(self.n_slices, lora_a_output_size_per_partition)
+
         self.lora_a_stacked = tuple(
             torch.zeros(
                 max_loras,

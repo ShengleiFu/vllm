@@ -110,6 +110,12 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
             dtype=lora_config.lora_dtype,
             device=self.device,
         )
+        # No-op unless VLLM_LORA_DETERMINISTIC_SPLIT_K is enabled; see
+        # lora_shrink_op.register_shrink_capacity for why this must happen
+        # at weight-construction time.
+        from vllm.lora.ops.triton_ops.lora_shrink_op import register_shrink_capacity
+
+        register_shrink_capacity(1, lora_config.max_lora_rank)
 
         if self.sharded_to_full_mapping is not None:
             self.sharded_to_full_mapping_gpu = torch.tensor(

@@ -16,7 +16,7 @@ from vllm.lora.ops.triton_ops.utils import (
     supports_pdl,
 )
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import current_stream, direct_register_custom_op
+from vllm.utils.torch_utils import aux_stream, current_stream, direct_register_custom_op
 from vllm.v1.worker.workspace import current_workspace_manager
 
 # Deterministic split-K for the batch-invariant shrink path. 0 keeps the
@@ -39,28 +39,148 @@ if _TWO_PASS_SPLIT_K:
         )
 
 
+# --------------------------------------------------------------------------
+# Fixed-capacity scratch registration.
+#
+# The two-pass partials buffer is a named-workspace pool shared by every
+# LoRA layer's shrink call (regular linear, QKV/merged/variable-slice, MoE
+# gate/up/down) *and* by every stream that can dispatch through it (the
+# persistent compute stream and the MoE shared-experts overlap stream,
+# gated by VLLM_DISABLE_SHARED_EXPERTS_STREAM, on by default and
+# independent of VLLM_LORA_ENABLE_DUAL_STREAM). Growing that buffer
+# incrementally, call by call, cannot be made safe under a workspace lock:
+# whichever call happens to run first on a given stream fixes that stream's
+# allocation, and a *different* call shape on the *same* stream later (a
+# different layer's slice/rank combination, or simply a larger token count)
+# would need to grow it -- which a locked workspace correctly refuses, and
+# an unlocked one would silently move the address out from under any
+# CUDA graph that already captured it.
+#
+# Instead, every LoRA layer and Punica wrapper registers the largest shape
+# it can ever pass to this op -- via register_shrink_capacity() at weight
+# construction time and register_shrink_token_capacity() at Punica wrapper
+# construction time, both of which happen during model/LoRA loading, well
+# before any profiling or graph capture. reserve_shrink_capacity_for_serving()
+# then allocates the single worst-case buffer, on every stream that can
+# reach this op, once -- before GPUModelRunner.capture_model() begins
+# capturing and before the workspace locks. Every real call thereafter
+# requests its own (possibly smaller) exact shape as before; because the
+# buffer is already at its registered maximum, that request never grows it.
+_registered_max_product = 0  # max(num_slices * n) over every registered call site
+_registered_max_m = 0  # max token count over every registered Punica wrapper
+_capacity_reserved = False
+
+
+def register_shrink_capacity(num_slices: int, n: int) -> None:
+    """Register a (num_slices, N) shape a LoRA shrink call site may use.
+
+    Must be called while building that layer's LoRA weights (before any
+    forward pass), so it happens before reserve_shrink_capacity_for_serving().
+    No-op unless VLLM_LORA_DETERMINISTIC_SPLIT_K is enabled.
+    """
+    global _registered_max_product
+    if not _TWO_PASS_SPLIT_K:
+        return
+    if _capacity_reserved:
+        raise RuntimeError(
+            "register_shrink_capacity() was called after split-K scratch "
+            "capacity was already reserved for serving; every LoRA layer's "
+            "shrink call shape must be registered before "
+            "reserve_shrink_capacity_for_serving() runs."
+        )
+    _registered_max_product = max(_registered_max_product, num_slices * n)
+
+
+def register_shrink_token_capacity(max_num_tokens: int) -> None:
+    """Register the maximum token count (M) a Punica wrapper may ever pass
+    to a LoRA shrink call (its own max_num_batched_tokens capacity -- the
+    main decoder path and multimodal tower/connector wrappers each register
+    their own, independent capacity). See register_shrink_capacity for the
+    registration/reservation lifecycle this must respect.
+    """
+    global _registered_max_m
+    if not _TWO_PASS_SPLIT_K:
+        return
+    if _capacity_reserved:
+        raise RuntimeError(
+            "register_shrink_token_capacity() was called after split-K "
+            "scratch capacity was already reserved for serving."
+        )
+    _registered_max_m = max(_registered_max_m, max_num_tokens)
+
+
+def _registered_capacity_elements() -> int | None:
+    if _registered_max_product == 0 or _registered_max_m == 0:
+        return None
+    return _registered_max_product * _TWO_PASS_SPLIT_K * _registered_max_m
+
+
+def reserve_shrink_capacity_for_serving() -> None:
+    """Reserve the two-pass scratch at its full registered capacity, on
+    every stream this op can be dispatched from.
+
+    Must run once, after every LoRA layer/Punica wrapper has registered its
+    call shape, and before any CUDA graph capture that might reference this
+    scratch -- i.e. at the start of GPUModelRunner.capture_model(), before
+    lock_workspace(). Idempotent: safe to call again (e.g. after
+    reset_named_workspaces() released everything for memory accounting);
+    re-registration after this point is what raises, not re-reservation.
+    """
+    global _capacity_reserved
+    if not _TWO_PASS_SPLIT_K:
+        return
+    _capacity_reserved = True
+    total_elements = _registered_capacity_elements()
+    if total_elements is None:
+        # No LoRA layer registered a shrink call shape yet (e.g. LoRA is
+        # configured but no adapter-bearing layer has built its weights).
+        # Nothing to reserve; a later real call will hit the capacity
+        # check in _get_two_pass_partials with a clear error instead of
+        # silently under-provisioning.
+        return
+    streams = [current_stream()]
+    aux = aux_stream()
+    if aux is not None and aux is not streams[0]:
+        streams.append(aux)
+    manager = current_workspace_manager()
+    for stream in streams:
+        with torch.cuda.stream(stream):
+            manager.get_simultaneous_named(
+                ("lora_shrink_two_pass", stream),
+                ((total_elements,), torch.float32),
+            )
+    torch.accelerator.synchronize()
+
+
 def _get_two_pass_partials(
     output: torch.Tensor, num_slices: int, split_k: int, m: int, n: int
 ) -> torch.Tensor:
-    # The runner-owned workspace supplies lifecycle, ubatch isolation, growth
-    # locking, and shutdown cleanup. The owner key must include the current
-    # CUDA stream: rejecting VLLM_LORA_ENABLE_DUAL_STREAM=1 at import time
-    # only rules out *that* mechanism's aux stream. It does not rule out the
-    # independent MoE shared-experts overlap stream (gated by
-    # VLLM_DISABLE_SHARED_EXPERTS_STREAM, on by default), which runs a
-    # LoRA-adapted shared-experts layer concurrently with this stream inside
-    # the same (ubatch, lane) slot. Without the stream in the key, those two
-    # concurrent lora_shrink calls would alias the same scratch buffer.
-    # A stream used only transiently (e.g. memory/graph-memory profiling)
-    # would otherwise keep its slot allocated for the workspace manager's
-    # lifetime; gpu_model_runner.profile_cudagraph_memory releases it via
-    # reset_named_workspaces() once profiling is synchronized, before real
-    # capture and lock_workspace(). A stream that first appears *after*
-    # lock (e.g. the shared-experts stream, which only runs for batch
-    # sizes small enough to trigger it and may not have been exercised
-    # during warmup) still gets its first allocation, since
-    # WorkspaceManager only forbids growing an *existing* per-stream
-    # allocation while locked, not creating a new one.
+    # The owner key includes the current CUDA stream: the independent MoE
+    # shared-experts overlap stream (see module docstring above) can run a
+    # LoRA-adapted shared-experts layer concurrently with this stream
+    # inside the same (ubatch, lane) slot, so the two must never alias.
+    #
+    # Once reserve_shrink_capacity_for_serving() has run (real serving,
+    # after every layer/wrapper registered its shape), enforce the
+    # registered bound explicitly, with a clear error, rather than letting
+    # an unregistered call silently fall through to WorkspaceManager's own
+    # (locked) growth check. Before that point -- e.g. a unit test that
+    # calls this op directly without constructing real LoRA layers -- fall
+    # back to the original lazy-growth behavior, still subject to the same
+    # (unconditional) lock check.
+    if _capacity_reserved:
+        required_elements = num_slices * split_k * m * n
+        total_elements = _registered_capacity_elements()
+        if total_elements is None or required_elements > total_elements:
+            raise RuntimeError(
+                f"LoRA shrink call (num_slices={num_slices}, "
+                f"split_k={split_k}, m={m}, n={n}) requires "
+                f"{required_elements} scratch elements, exceeding the "
+                f"{total_elements or 0} registered via "
+                "register_shrink_capacity()/register_shrink_token_capacity(). "
+                "Every LoRA layer and Punica wrapper reachable from this "
+                "path must register its shape before serving starts."
+            )
     (partials,) = current_workspace_manager().get_simultaneous_named(
         ("lora_shrink_two_pass", current_stream()),
         ((num_slices, split_k, m, n), torch.float32),

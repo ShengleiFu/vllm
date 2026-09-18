@@ -220,19 +220,19 @@ class WorkspaceManager:
         current_workspace = slots[workspace_id]
         current_size = self._workspace_size_bytes(current_workspace)
         if current_size < required_bytes:
-            # Only forbid *growing* an existing allocation while locked: a
-            # CUDA graph may already reference it at its current size, so
-            # resizing would move or invalidate that pointer. A slot that
-            # has never been allocated (current_workspace is None) cannot
-            # be referenced by any captured graph yet, so allocating it for
-            # the first time is safe even after locking -- e.g. an owner
-            # keyed by a stream that only appears for batch sizes small
-            # enough to trigger the MoE shared-experts overlap stream
-            # (gated by a token-count threshold) may never have been
-            # exercised during warmup/capture, which always uses larger
-            # batch sizes on that stream, and would otherwise crash on its
-            # first real occurrence in steady-state serving.
-            if self._locked and current_workspace is not None:
+            # Strict: any allocation or growth is forbidden once locked,
+            # including a brand-new owner's first allocation. A permissive
+            # "first touch is safe" exception is not sound in general --
+            # e.g. work forked onto another stream via CUDA events (as the
+            # MoE shared-experts overlap stream does) can be captured into
+            # the *same* CUDA graph as the main stream, so that stream's
+            # first-ever allocation can already be graph-referenced. Callers
+            # that need scratch on a given stream after lock must reserve it
+            # before locking (see lora_shrink_op.reserve_shrink_capacity_
+            # for_serving for the pattern: register every supported call
+            # shape at weight-construction time, then reserve the
+            # worst-case buffer on every relevant stream before capture).
+            if self._locked:
                 raise AssertionError(
                     f"Named workspace {owner!r} is locked but requires "
                     f"{required_bytes / _MB:.2f} MB; current size is "

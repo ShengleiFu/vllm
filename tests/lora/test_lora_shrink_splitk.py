@@ -842,116 +842,180 @@ def test_lora_shrink_splitk_shared_experts_stream_isolation():
 
 
 # ---------------------------------------------------------------------------
-# Workspace-lock lifecycle regressions (second review round): a stream that
-# only appears for batch sizes small enough to trigger the MoE
-# shared-experts overlap path may never be warmed up before the workspace
-# locks, and a throwaway profiling stream's scratch must actually be
-# released, not merely retained-and-documented.
+# Fixed-capacity registration/reservation regressions (third review round).
+# Incremental per-call growth cannot be made safe under a strict lock: the
+# fix is for every LoRA layer/Punica wrapper to register its largest call
+# shape at weight-construction time, and for reserve_shrink_capacity_for_
+# serving() to allocate the worst case, on every relevant stream, before
+# any CUDA graph capture and before lock_workspace(). The lock itself stays
+# strict -- no "first touch after lock is safe" exception, since work
+# forked onto another stream via CUDA events (as the MoE shared-experts
+# overlap stream does) can be captured into the *same* graph as the main
+# stream.
 # ---------------------------------------------------------------------------
 
-_NEW_STREAM_AFTER_LOCK_SCRIPT = textwrap.dedent(
+_CAPACITY_LIFECYCLE_SCRIPT = textwrap.dedent(
     """
     import json
     import torch
     from vllm.lora.ops.triton_ops import lora_shrink
+    import vllm.lora.ops.triton_ops.lora_shrink_op as lora_shrink_op
     from vllm.lora.ops.triton_ops.lora_kernel_metadata import LoRAKernelMeta
     from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT
+    from vllm.utils.torch_utils import aux_stream as get_aux_stream
     from vllm.v1.worker.workspace import init_workspace_manager, lock_workspace
 
     device = "cuda:0"
     init_workspace_manager(torch.device(device))
 
     HIDDEN = 2560
-    RANK = 16
     NUM_ADAPTERS = 2
-    NSLICES = 1
     SCALING = 0.9
     DTYPE = torch.bfloat16
-    M = 32
+    # Mirrors a QKV layer (3 slices, small rank) feeding into a row-projection
+    # layer (1 slice, larger rank) on the *same* owner/stream -- the review's
+    # concrete example of why maxing each dimension independently is wrong
+    # (3*16=48 vs 1*64=64; the true bound is max(48,64), not 3*64).
+    QKV_SLICES, QKV_RANK = 3, 16
+    ROW_SLICES, ROW_RANK = 1, 64
+    M_SMALL, M_LARGE = 32, 256
 
-    lora_a = [torch.randn((NUM_ADAPTERS, RANK, HIDDEN), dtype=DTYPE, device=device)]
-
-    def run(stream, seed):
+    def run(stream, m, rank, n_slices, seed):
         g = torch.Generator(device=device).manual_seed(seed)
-        inputs = torch.randn((M, HIDDEN), dtype=DTYPE, device=device, generator=g)
+        lora_a = [
+            torch.randn((NUM_ADAPTERS, rank, HIDDEN), dtype=DTYPE, device=device,
+                        generator=g)
+            for _ in range(n_slices)
+        ]
+        inputs = torch.randn((m, HIDDEN), dtype=DTYPE, device=device, generator=g)
         mapping = torch.randint(
-            0, NUM_ADAPTERS, (M,), dtype=torch.int32, device=device, generator=g
+            0, NUM_ADAPTERS, (m,), dtype=torch.int32, device=device, generator=g
         )
-        meta = LoRAKernelMeta.make(
-            max_loras=NUM_ADAPTERS, max_num_tokens=M, device=device
-        )
+        meta = LoRAKernelMeta.make(max_loras=NUM_ADAPTERS, max_num_tokens=m,
+                                     device=device)
         meta.prepare_tensors(mapping)
-        out = torch.zeros((NSLICES, M, RANK), dtype=torch.float32, device=device)
+        out = torch.zeros((n_slices, m, rank), dtype=torch.float32, device=device)
         producer_stream = torch.cuda.current_stream()
         with torch.cuda.stream(stream):
             stream.wait_stream(producer_stream)
             _LORA_A_PTR_DICT.clear()
             lora_shrink(
                 inputs, lora_a, out,
-                *meta.meta_args(token_nums=M, specialize_active_lora=False),
+                *meta.meta_args(token_nums=m, specialize_active_lora=False),
                 SCALING,
             )
         stream.synchronize()
-        return inputs, mapping, out
+        return lora_a, inputs, mapping, out
 
-    def cpu_reference(inputs, mapping):
+    def cpu_reference(lora_a, inputs, mapping, n_slices, rank):
         inputs_cpu = inputs.double().cpu()
         mapping_cpu = mapping.cpu()
-        w_cpu = lora_a[0].double().cpu()
-        ref = torch.zeros((M, RANK), dtype=torch.float64)
-        for lid in range(NUM_ADAPTERS):
-            mask = mapping_cpu == lid
-            if mask.any():
-                ref[mask] = SCALING * (inputs_cpu[mask] @ w_cpu[lid].T)
+        ref = torch.zeros((n_slices, inputs.size(0), rank), dtype=torch.float64)
+        for s in range(n_slices):
+            w_cpu = lora_a[s].double().cpu()
+            for lid in range(NUM_ADAPTERS):
+                mask = mapping_cpu == lid
+                if mask.any():
+                    ref[s, mask] = SCALING * (inputs_cpu[mask] @ w_cpu[lid].T)
         return ref
 
-    # Warm up and capture only on the main/default stream, mirroring how
-    # gpu_model_runner.capture_model warms every graph size on a single
-    # stream before locking.
+    results = {}
+
+    # --- Scenario A: without registration, strict lock rejects a stream's
+    # first touch after lock (documents the hazard the mechanism protects
+    # against; this is the *correct*, safe failure mode, not a bug). ---
     main_stream = torch.cuda.current_stream()
-    run(main_stream, seed=1)
+    run(main_stream, M_SMALL, QKV_RANK, QKV_SLICES, seed=1)
+    lock_workspace()
+    random_new_stream = torch.cuda.Stream(device=device)
+    try:
+        run(random_new_stream, M_SMALL, QKV_RANK, QKV_SLICES, seed=2)
+        results["unregistered_new_stream_after_lock_raised"] = False
+    except AssertionError:
+        results["unregistered_new_stream_after_lock_raised"] = True
+
+    # Fresh manager for the properly-registered scenarios below.
+    init_workspace_manager(torch.device(device))
+    lora_shrink_op._registered_max_product = 0
+    lora_shrink_op._registered_max_m = 0
+    lora_shrink_op._capacity_reserved = False
+
+    # --- Scenario B: register every supported shape (QKV and row, at the
+    # largest token count) up front, then reserve, *then* lock. The real
+    # MoE shared-experts overlap stream (the actual global singleton
+    # reserve_shrink_capacity_for_serving() targets, not an arbitrary new
+    # stream) never touched lora_shrink before lock, and still works on
+    # its first real use; growing from a small captured shape (QKV at
+    # M_SMALL) to a larger one (row at M_LARGE) on the *same* stream also
+    # works, since capacity was sized for the worst case, not whatever
+    # happened to run first. ---
+    lora_shrink_op.register_shrink_capacity(QKV_SLICES, QKV_RANK)
+    lora_shrink_op.register_shrink_capacity(ROW_SLICES, ROW_RANK)
+    lora_shrink_op.register_shrink_token_capacity(M_LARGE)
+    lora_shrink_op.reserve_shrink_capacity_for_serving()
+
+    qkv_a, qkv_in, qkv_map, qkv_out = run(
+        main_stream, M_SMALL, QKV_RANK, QKV_SLICES, seed=3
+    )
     lock_workspace()
 
-    # A brand-new stream -- e.g. the MoE shared-experts overlap stream,
-    # which only runs for batch sizes small enough to trigger it and may
-    # never have been exercised during warmup -- must still work the first
-    # time it is used after locking, instead of raising "is locked".
-    aux_stream = torch.cuda.Stream(device=device)
-    raised = False
-    inputs = mapping = out = None
+    row_a, row_in, row_map, row_out = run(
+        main_stream, M_LARGE, ROW_RANK, ROW_SLICES, seed=4
+    )
+    results["cross_shape_growth_after_lock_ok"] = True  # no exception raised
+
+    aux_stream = get_aux_stream()
+    aux_a, aux_in, aux_map, aux_out = run(
+        aux_stream, M_SMALL, QKV_RANK, QKV_SLICES, seed=5
+    )
+    results["registered_new_stream_after_lock_ok"] = True
+
+    qkv_ref = cpu_reference(qkv_a, qkv_in, qkv_map, QKV_SLICES, QKV_RANK)
+    row_ref = cpu_reference(row_a, row_in, row_map, ROW_SLICES, ROW_RANK)
+    aux_ref = cpu_reference(aux_a, aux_in, aux_map, QKV_SLICES, QKV_RANK)
+    results["qkv_correct"] = bool(
+        torch.allclose(qkv_out.double().cpu(), qkv_ref, rtol=0.005, atol=0.005)
+    )
+    results["row_correct"] = bool(
+        torch.allclose(row_out.double().cpu(), row_ref, rtol=0.005, atol=0.005)
+    )
+    results["aux_correct"] = bool(
+        torch.allclose(aux_out.double().cpu(), aux_ref, rtol=0.005, atol=0.005)
+    )
+
+    # --- Scenario C: a call whose shape exceeds what was registered must
+    # be rejected before launch, with a clear error -- not silently
+    # truncated/misdirected. ---
     try:
-        inputs, mapping, out = run(aux_stream, seed=2)
-    except AssertionError:
-        raised = True
+        run(main_stream, M_LARGE * 2, ROW_RANK, ROW_SLICES, seed=6)
+        results["oversized_call_rejected"] = False
+    except RuntimeError as e:
+        results["oversized_call_rejected"] = "exceeding" in str(e)
 
-    correct = False
-    if not raised:
-        ref = cpu_reference(inputs, mapping)
-        correct = bool(
-            torch.allclose(out[0].double().cpu(), ref, rtol=0.005, atol=0.005)
-        )
-
-    print(json.dumps({
-        "raised_locked_assertion": raised,
-        "result_correct": correct,
-    }))
+    print(json.dumps(results))
     """
 )
 
 
-def test_lora_shrink_splitk_new_stream_first_use_after_lock():
-    """Regression for the round-3 review's P1 finding: the MoE
-    shared-experts overlap stream only runs for batch sizes small enough to
-    trigger it (VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD), so it may never
-    touch lora_shrink during warmup/capture (which always warms up at each
-    captured graph's own, typically larger, size on the main stream). Its
-    first real use can therefore happen after lock_workspace(), which must
-    not crash.
+def test_lora_shrink_splitk_capacity_registration_lifecycle():
+    """Covers the third review round's minimal regression plan:
+    unregistered new-stream-after-lock still fails safely (strict lock,
+    no exception carved out); registering every supported shape (small
+    QKV-like and larger row-like, at the true max token count) and
+    reserving before lock lets both cross-shape growth *and* a
+    never-before-seen stream succeed after lock, correctly; and a call
+    exceeding registered capacity is rejected before launch instead of
+    silently truncated.
     """
-    result = _run(_NEW_STREAM_AFTER_LOCK_SCRIPT, _S8_ENV, timeout=300)
+    result = _run(_CAPACITY_LIFECYCLE_SCRIPT, _S8_ENV, timeout=300)
     print(json.dumps(result, indent=2))
-    assert not result["raised_locked_assertion"], result
-    assert result["result_correct"], result
+    assert result["unregistered_new_stream_after_lock_raised"], result
+    assert result["cross_shape_growth_after_lock_ok"], result
+    assert result["registered_new_stream_after_lock_ok"], result
+    assert result["qkv_correct"], result
+    assert result["row_correct"], result
+    assert result["aux_correct"], result
+    assert result["oversized_call_rejected"], result
 
 
 _PROFILING_SCRATCH_RELEASED_SCRIPT = textwrap.dedent(
